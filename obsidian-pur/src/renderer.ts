@@ -1,5 +1,5 @@
 import { check } from "./binary";
-import { BoardImage, boardBounds, Bounds, Clip, invert, Matrix, multiply, Point, transform } from "./board";
+import { BoardImage, boardBounds, Bounds, Clip, compareImageStack, invert, Matrix, multiply, Point, transform } from "./board";
 import { Camera, gesturePoints } from "./camera";
 import { Alignment, BoardEditor } from "./editor";
 import { drawGrid } from "./grid";
@@ -59,17 +59,34 @@ function clipPath(context: CanvasRenderingContext2D, clip: Clip): void {
   context.clip(clip.fillRule);
 }
 
-export function drawBoard(context: CanvasRenderingContext2D, images: DecodedImage[], camera: Camera): void {
+export function drawBoard(context: CanvasRenderingContext2D, images: DecodedImage[], camera: Camera,
+  groups: BoardImage[] = []): void {
   context.save();
   context.translate(camera.x, camera.y);
   context.scale(camera.scale, camera.scale);
-  for (const { image, bitmap } of images) {
+  const entries: { image: BoardImage; bitmap?: ImageBitmap }[] = [...images, ...groups.map(image => ({ image }))];
+  const order = new Map(entries.map((entry, i) => [entry.image.id, i]));
+  entries.sort((a, b) => compareImageStack(a.image, b.image, order.get(a.image.id)!, order.get(b.image.id)!));
+  for (const { image, bitmap } of entries) {
     context.save();
     context.globalAlpha = image.opacity;
     context.transform(...image.item);
     if (image.clip) clipPath(context, image.clip);
     context.transform(...image.image);
-    context.drawImage(bitmap, 0, 0, image.width, image.height);
+    if (image.group) {
+      const color = image.group.color;
+      context.fillStyle = color ? `#${color.slice(3)}${color.slice(1, 3)}` : "#202020";
+      const radius = Math.min(8, image.width / 2, image.height / 2);
+      context.beginPath();
+      context.moveTo(radius, 0); context.lineTo(image.width - radius, 0);
+      context.quadraticCurveTo(image.width, 0, image.width, radius);
+      context.lineTo(image.width, image.height - radius);
+      context.quadraticCurveTo(image.width, image.height, image.width - radius, image.height);
+      context.lineTo(radius, image.height);
+      context.quadraticCurveTo(0, image.height, 0, image.height - radius);
+      context.lineTo(0, radius); context.quadraticCurveTo(0, 0, radius, 0);
+      context.fill();
+    } else if (bitmap) context.drawImage(bitmap, 0, 0, image.width, image.height);
     context.restore();
   }
   context.restore();
@@ -133,14 +150,19 @@ export class BoardRenderer {
   private pendingFront?: number;
   private readonly tieOrder = new Map<number, number>();
   private transformDiagnostic?: TransformDiagnostic;
-  private groupFrame?: { geometry: ImageGeometry; states: { id: number; item: Matrix }[] };
+  private groupFrame?: { geometry: ImageGeometry; states: {
+    id: number; item: Matrix; width: number; height: number; image: Matrix;
+  }[] };
 
   private selectionGeometry(): ImageGeometry | undefined {
     const images = this.editor.selectedImages;
     if (images.length < 2) { this.groupFrame = undefined; return images[0]; }
     const cached = this.groupFrame;
     if (cached && images.length === cached.states.length && images.every((image, index) =>
-      image.id === cached.states[index].id && image.item.every((value, i) => value === cached.states[index].item[i])))
+      image.id === cached.states[index].id && image.width === cached.states[index].width &&
+      image.height === cached.states[index].height &&
+      image.image.every((value, i) => value === cached.states[index].image[i]) &&
+      image.item.every((value, i) => value === cached.states[index].item[i])))
       return cached.geometry;
     const geometry = selectionFrame(images)!;
     this.rememberFrame(geometry);
@@ -149,7 +171,9 @@ export class BoardRenderer {
 
   private rememberFrame(geometry: ImageGeometry): void {
     if (this.editor.selectedImages.length < 2) return;
-    this.groupFrame = { geometry, states: this.editor.selectedImages.map(image => ({ id: image.id, item: [...image.item] })) };
+    this.groupFrame = { geometry, states: this.editor.selectedImages.map(image => ({
+      id: image.id, item: [...image.item], image: [...image.image], width: image.width, height: image.height,
+    })) };
   }
 
   constructor(
@@ -224,6 +248,10 @@ export class BoardRenderer {
         const p = point(event);
         const modified = event.ctrlKey || event.metaKey;
         const hit = this.hitTest(p);
+        if (hit?.group?.unsupported) { this.onError(new Error(hit.group.unsupported)); return; }
+        if (hit && this.editor.isSelected(hit.id) && this.editor.selectedImages.some(image => image.group?.unsupported)) {
+          this.onError(new Error("未対応の子要素を持つグループは編集できません")); return;
+        }
         const marquee = event.shiftKey && !hit;
         const selected = modified || marquee ? undefined : this.selectionGeometry();
         const handles = selected ? imageHandles(selected) : [];
@@ -371,7 +399,7 @@ export class BoardRenderer {
       if (event.type === "pointerup" && this.pointers.size === 1 &&
         this.pointers.has(event.pointerId) && this.gesture.kind === "marquee") {
         const start = this.gesture.start, end = this.worldPoint(point(event));
-        this.editor.selectIds(this.editor.images.filter(image =>
+        this.editor.selectIds(this.editor.scopeItems.filter(image =>
           intersectsSelection(image, start, end))
           .map(image => image.id));
       }
@@ -387,6 +415,12 @@ export class BoardRenderer {
       if (this.pointers.size === 0) setHoverCursor(point(event), event.pointerType);
     };
     canvas.addEventListener("pointerup", release, { signal });
+    canvas.addEventListener("dblclick", event => {
+      if (!this.editing) return;
+      const rect = canvas.getBoundingClientRect();
+      const hit = this.hitTest({ x: event.clientX - rect.left, y: event.clientY - rect.top });
+      if (hit?.group) this.editGroup(hit.id);
+    }, { signal });
     canvas.addEventListener("pointercancel", release, { signal });
     canvas.addEventListener("lostpointercapture", release, { signal });
     canvas.addEventListener("wheel", event => {
@@ -404,7 +438,8 @@ export class BoardRenderer {
         this.removeSelected();
       } else if (this.editing && event.key === "Escape") {
         this.finishPendingEdit();
-        this.editor.select();
+        if (!this.editor.selectedImages.length && this.editor.editingParent !== -1) this.editor.leaveGroup();
+        else this.editor.select();
         this.render();
       } else if (this.editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
         if (event.shiftKey) this.redo(); else this.undo();
@@ -455,8 +490,9 @@ export class BoardRenderer {
     this.render();
   }
 
-  get canTransformSelected(): boolean { return this.editing && this.editor.selected !== undefined; }
-  get canRotateSelected(): boolean { return this.editing && this.editor.selectedImages.length > 0; }
+  get canTransformSelected(): boolean { return this.editing && this.editor.selected !== undefined && !this.editor.selected.group?.unsupported; }
+  get canRotateSelected(): boolean { return this.editing && this.editor.selectedImages.length > 0 &&
+    !this.editor.selectedImages.some(image => image.group?.unsupported); }
   get canRemoveSelected(): boolean { return this.editing && this.editor.selectedImages.length > 0; }
   get canAlignSelected(): boolean { return this.editing && this.editor.selectedImages.length > 1; }
   alignSelected(alignment: Alignment): void {
@@ -488,7 +524,7 @@ export class BoardRenderer {
   removeSelected(): void {
     if (!this.canRemoveSelected) return;
     this.finishPendingEdit();
-    this.editor.removeSelected();
+    try { this.editor.removeSelected(); } catch (error) { this.onError(error); }
     this.renderImmediately();
   }
   rotateSelected(angle: number): void {
@@ -545,7 +581,7 @@ export class BoardRenderer {
       context.scale(ratioX, ratioY);
       drawGrid(context, this.camera, this.canvas.clientWidth, this.canvas.clientHeight);
       this.sortDecodedImages();
-      drawBoard(context, this.activeImages(), this.camera);
+      drawBoard(context, this.activeImages(), this.camera, this.editor.images.filter(image => image.group));
       if (this.editing) {
         drawSelection(context, this.selectionGeometry(), this.camera);
         if (this.gesture.kind === "marquee") {
@@ -586,6 +622,30 @@ export class BoardRenderer {
     this.pointers.clear();
   }
   undo(): void { this.finishPendingEdit(); this.editor.undo(); this.render(); }
+  editGroup(id = this.editor.selectedId): void {
+    if (!this.editing || id === undefined) return;
+    this.finishPendingEdit();
+    try { this.editor.enterGroup(id); this.render(); } catch (error) { this.onError(error); }
+  }
+  parentGroup(): void {
+    if (!this.editing) return;
+    this.finishPendingEdit(); this.editor.leaveGroup(); this.render();
+  }
+  groupSelected(): void {
+    if (!this.editing) return;
+    this.finishPendingEdit();
+    try { this.editor.groupSelected(); this.render(); } catch (error) { this.onError(error); }
+  }
+  ungroupSelected(): void {
+    if (!this.editing) return;
+    this.finishPendingEdit();
+    try { this.editor.ungroupSelected(); this.render(); } catch (error) { this.onError(error); }
+  }
+  groupColor(color: string | null): void {
+    if (!this.editing) return;
+    this.finishPendingEdit();
+    try { this.editor.setGroupColor(color); this.render(); } catch (error) { this.onError(error); }
+  }
   redo(): void { this.finishPendingEdit(); this.editor.redo(); this.render(); }
   discardEdits(): void { this.finishPendingEdit(); this.editor.discard(); this.render(); }
   private commitGesture(): void {
@@ -614,8 +674,8 @@ export class BoardRenderer {
     catch (error) { this.onError(error); }
   }
   private sortDecodedImages(): void {
-    this.images.sort((a, b) => a.image.z - b.image.z ||
-      this.tieOrder.get(a.image.id)! - this.tieOrder.get(b.image.id)!);
+    this.images.sort((a, b) => compareImageStack(a.image, b.image,
+      this.tieOrder.get(a.image.id)!, this.tieOrder.get(b.image.id)!));
   }
   private activeImages(): DecodedImage[] {
     const ids = new Set(this.editor.images.map(image => image.id));
@@ -628,9 +688,9 @@ export class BoardRenderer {
     this.sortDecodedImages();
     const world = { x: (screen.x - this.camera.x) / this.camera.scale,
       y: (screen.y - this.camera.y) / this.camera.scale };
-    const images = this.activeImages();
+    const images = this.editor.scopeItems;
     for (let i = images.length - 1; i >= 0; i--) {
-      const image = images[i].image;
+      const image = images[i];
       const inverse = invert(multiply(image.item, image.image));
       if (!inverse) continue;
       const local = transform(inverse, world);

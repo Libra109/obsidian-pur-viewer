@@ -475,6 +475,105 @@ async function run(): Promise<void> {
   const context = canvas.getContext("2d")!;
   {
     const seed = smallBoard.images[0];
+    const images: BoardImage[] = [0, 1].map(id => ({
+      ...seed, id, parent: undefined, group: undefined, clip: undefined, z: id + 1,
+      width: 40, height: 40, item: [1, 0, 0, 1, id * 80, 0], image: [1, 0, 0, 1, 0, 0],
+    }));
+    const decoded = await Promise.all(images.map(async image => {
+      const source = document.createElement("canvas"); source.width = 40; source.height = 40;
+      const ctx = source.getContext("2d")!; ctx.fillStyle = image.id === 0 ? "#00ff00" : "#0000ff";
+      ctx.fillRect(0, 0, 40, 40);
+      return { image, bitmap: await createImageBitmap(source) };
+    }));
+    const first = images[0];
+    const editor = new BoardEditor(images);
+    editor.selectIds([0, 1]); editor.groupSelected();
+    const group = editor.selected!;
+    const errors: unknown[] = [];
+    const renderer = new BoardRenderer(canvas, decoded, boardBounds(editor.images), editor, () => {},
+      error => errors.push(error));
+    const capture = canvas.setPointerCapture;
+    canvas.setPointerCapture = () => {};
+    const screen = (world: { x: number; y: number }) => ({
+      x: world.x * renderer.camera.scale + renderer.camera.x,
+      y: world.y * renderer.camera.scale + renderer.camera.y,
+    });
+    const send = (type: string, world: { x: number; y: number }, pointerId = 1, pointerType = "mouse") => {
+      const p = screen(world), rect = canvas.getBoundingClientRect();
+      canvas.dispatchEvent(new PointerEvent(type, { pointerId, pointerType, button: 0,
+        clientX: rect.left + p.x, clientY: rect.top + p.y, bubbles: true }));
+    };
+    try {
+      renderer.setEditMode(true);
+      renderer.groupColor("#ffd23131");
+      await nextFrame();
+      const border = transform(multiply(group.item, group.image), { x: group.width / 2, y: 3 });
+      const p = screen(border);
+      const pixel = context.getImageData(Math.round(p.x * canvas.width / canvas.clientWidth),
+        Math.round(p.y * canvas.height / canvas.clientHeight), 1, 1).data;
+      assert(pixel[0] === 210 && pixel[1] === 49 && pixel[2] === 49,
+        "グループ背景は子画像の背面にARGB指定色で描画");
+      renderer.groupColor("#7fd23131"); await nextFrame();
+      const translucent = context.getImageData(Math.round(p.x * canvas.width / canvas.clientWidth),
+        Math.round(p.y * canvas.height / canvas.clientHeight), 1, 1).data;
+      assert(Math.abs(translucent[0] - 210) <= 1 && Math.abs(translucent[1] - 49) <= 1 && translucent[3] === 127,
+        "ARGB背景のアルファをCanvasで保持");
+      renderer.groupColor("#ffd23131"); await nextFrame();
+      editor.select();
+      send("pointerdown", imageCenter(first)); send("pointerup", imageCenter(first));
+      assert(editor.selectedId === group.id, "通常クリックは画像ではなく現在階層のグループを選択");
+      const initial = editor.snapshot();
+      const from = imageCenter(group), to = { x: from.x + 13, y: from.y - 7 };
+      send("pointerdown", from); send("pointermove", to); send("pointerup", to);
+      assert(images.filter(image => !image.group).every(image =>
+        Math.abs(image.item[4] - initial.find(state => state.id === image.id)!.item[4] - 13) < 1e-8),
+      "グループのドラッグは全子画像を同時に移動");
+      renderer.undo();
+      assert(editor.snapshot().every((state, index) => state.id === initial[index].id &&
+        state.z === initial[index].z && state.item.every((value, i) => value === initial[index].item[i]) &&
+        state.content.image.every((value, i) => value === initial[index].content.image[i])),
+      "グループ移動を1回でUndoし子配置も復元");
+      const handles = imageHandles(group), start = handles[4], anchor = handles[0];
+      send("pointerdown", start);
+      send("pointermove", { x: start.x + (start.x - anchor.x) / 4, y: start.y + (start.y - anchor.y) / 4 });
+      send("pointerup", { x: start.x + (start.x - anchor.x) / 4, y: start.y + (start.y - anchor.y) / 4 });
+      assert(Math.abs(group.item[0] / initial.find(state => state.id === group.id)!.item[0] - 1.25) < 1e-8,
+        "グループの拡縮ハンドルは対向点を固定して子全体を等比拡縮");
+      renderer.undo();
+      renderer.rotateSelected(Math.PI / 2);
+      assert(Math.abs(group.item[1] - initial.find(state => state.id === group.id)!.item[0]) < 1e-8,
+        "グループ回転は共通中心で子全体を回転");
+      renderer.undo();
+      const beforePinch = editor.snapshot(), oldScale = renderer.camera.scale;
+      const firstPoint = imageCenter(first), secondPoint = imageCenter(editor.images.find(image => image.id === 1)!);
+      send("pointerdown", firstPoint, 1, "touch"); send("pointerdown", secondPoint, 2, "touch");
+      send("pointermove", { x: secondPoint.x + 10, y: secondPoint.y + 10 }, 2, "touch");
+      send("pointerup", secondPoint, 2, "touch"); send("pointerup", firstPoint, 1, "touch");
+      assert(renderer.camera.scale !== oldScale && editor.selectedId === group.id &&
+        editor.snapshot().every((state, index) => state.item.every((value, i) => value === beforePinch[index].item[i])),
+      "グループ選択中も2本指操作は子配置を変えずカメラだけを変更");
+      renderer.setEditMode(false);
+      const oldParent = editor.editingParent;
+      renderer.editGroup(); renderer.parentGroup(); renderer.groupSelected(); renderer.ungroupSelected();
+      assert(editor.editingParent === oldParent && editor.images.length === beforePinch.length,
+        "閲覧モードではグループ階層と作成解除の操作を無効化");
+      renderer.setEditMode(true);
+      const rect = canvas.getBoundingClientRect(), center = screen(imageCenter(first));
+      canvas.dispatchEvent(new MouseEvent("dblclick", { clientX: rect.left + center.x, clientY: rect.top + center.y }));
+      assert(editor.editingParent === group.id, "ダブルクリックでグループ内部へ入る");
+      send("pointerdown", imageCenter(first)); send("pointerup", imageCenter(first));
+      assert(editor.selectedId === first.id, "内部では画像を直接選択");
+      editor.selectIds([0, 1]); renderer.groupSelected();
+      const nestedId = editor.selectedId!;
+      renderer.editGroup();
+      assert(editor.editingParent === nestedId, "内部のグループ化と入れ子の編集階層に対応");
+      renderer.parentGroup(); renderer.parentGroup();
+      assert(editor.editingParent === -1 && editor.selectedId === group.id, "親へ戻る操作で入れ子からルートへ戻る");
+      assert(errors.length === 0, "グループの描画と操作で例外なし");
+    } finally { canvas.setPointerCapture = capture; renderer.dispose(); }
+  }
+  {
+    const seed = smallBoard.images[0];
     const first = { ...seed, clip: undefined, id: 100, item: [1, 0, 0, 1, 0, 0] as typeof seed.item,
       image: [1, 0, 0, 1, 0, 0] as typeof seed.image, z: 0 };
     const second = { ...seed, clip: undefined, id: 101, item: [1, 0, 0, 1, 32, 0] as typeof seed.item,

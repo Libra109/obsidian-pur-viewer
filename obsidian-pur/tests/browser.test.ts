@@ -10,6 +10,7 @@ import { animatedWebp, bmpFixture, gifFixture } from "./raster-fixtures";
 import { svgFixture } from "./svg-fixtures";
 import { transformedBounds } from "../src/board";
 import { imageCenter, imageHandles, rotationHandles, selectionFrame } from "../src/handles";
+import { groupFixture } from "./group-fixture";
 
 test("browser bundle parses actual v2 and rejects legacy without Node, WASM assets or network", async () => {
   // Use the exact same build settings as the shipped plugin.
@@ -70,8 +71,11 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal(shippedEntry, bundle.outputFiles[0].text, "build dist before testing the shipped plugin");
   const requests: string[] = [];
   let fileMenuHandler: ((menu: MenuStub, file: FakeTFile) => void) | undefined;
-  const menuActions: (() => void)[] = [];
-  const titledActions = new Map<string, () => void>();
+  type MenuEvent = { clientX: number; clientY: number; pointerType?: string } | { key: string };
+  const menuActions: ((event?: MenuEvent) => void)[] = [];
+  const titledActions = new Map<string, (event?: MenuEvent) => void>();
+  const shownMenus: MenuStub[] = [];
+  const headerActions = new Map<string, (event: MenuEvent) => void>();
   const menuChecks = new Map<string, boolean>();
   const menuDisabled = new Map<string, boolean>();
   interface CommandStub { id: string; name: string; hotkeys?: unknown[]; callback?: () => void; checkCallback?: (checking: boolean) => boolean }
@@ -143,8 +147,12 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     renderer: {
       insertionPoint(point?: { x: number; y: number }): { x: number; y: number };
       camera: { x: number; y: number; scale: number };
+      editGroup(id?: number): void;
+      parentGroup(): void;
+      undo(): void;
     };
     onPaneMenu(menu: MenuStub, source: string): void;
+    runPurAction(action: "save" | "undo" | "redo" | "fit" | "menu"): void;
     editor: {
       snapshot(): ImageEditState[];
       bringToFront(id: number): void;
@@ -155,6 +163,9 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
       discard(): void;
       select(id?: number): void;
       toggleSelection(id: number): void;
+      selectIds(ids: number[]): void;
+      editingParent: number;
+      selected?: import("../src/board").BoardImage;
       selectedImages: { id: number }[];
       selectedId?: number;
       dirty: boolean;
@@ -226,25 +237,40 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     }
   }
   class MenuStub {
+    items: MenuItemStub[] = [];
+    position?: { x: number; y: number };
+    doc?: unknown;
     addItem(callback: (item: MenuItemStub) => void) {
-      callback(new MenuItemStub());
+      const item = new MenuItemStub();
+      this.items.push(item);
+      callback(item);
       return this;
     }
-    showAtMouseEvent() {}
-    showAtPosition() {}
+    showAtMouseEvent() { shownMenus.push(this); }
+    showAtPosition(position: { x: number; y: number }, doc: unknown) {
+      this.position = position; this.doc = doc; shownMenus.push(this);
+    }
   }
   class MenuItemStub {
     title = "";
+    callback?: (event?: MenuEvent) => void;
     setTitle(title: string) { this.title = title; return this; }
     setIcon(_icon: string) { return this; }
     setDisabled(disabled: boolean) { menuDisabled.set(this.title, disabled); return this; }
     setChecked(checked: boolean) { menuChecks.set(this.title, checked); return this; }
-    onClick(callback: () => void) {
+    onClick(callback: (event?: MenuEvent) => void) {
+      this.callback = callback;
       menuActions.push(callback);
       titledActions.set(this.title, callback);
       return this;
     }
   }
+  const openPurMenu = (view: TestView) => {
+    const root = new MenuStub();
+    view.onPaneMenu(root, "more-options");
+    for (const item of root.items) item.callback?.();
+    return root;
+  };
   class Plugin {
     readonly disposers: Array<() => void> = [];
     register(callback: () => void) { this.disposers.push(callback); }
@@ -410,7 +436,10 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     }
     registerEvent(_event: unknown) {}
     register(_callback: () => void) {}
-    addAction() { return new ElementStub(); }
+    addAction(_icon: string, title: string, callback: (event: MenuEvent) => void) {
+      headerActions.set(title, callback);
+      return new ElementStub();
+    }
     onPaneMenu(_menu: MenuStub, _source: string) {}
   }
   class ButtonComponent {
@@ -544,7 +573,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.ok(diagnosticsCommand);
   diagnosticsCommand.callback!();
   const diagnosticNotice = diagnosticOutputs[diagnosticOutputs.length - 1]?.value ?? "";
-  assert.ok(diagnosticNotice.includes("ビルド: 0.15.0"));
+  assert.ok(diagnosticNotice.includes("ビルド: 0.18.1"));
   assert.ok(diagnosticNotice.includes("ファイル読込 failed"));
   const first = new FakeTFile("boards/first.pur");
   const second = new FakeTFile("boards/second.pur");
@@ -680,13 +709,13 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   activeView = lifecycleView;
   assert.equal(saveCommand?.checkCallback?.(true), true);
   assert.equal(saveCommand?.hotkeys, undefined, "PUR command must not register a duplicate global hotkey");
-  lifecycleView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(lifecycleView);
   assert.ok(titledActions.has("選択時に最前面へ移動"));
   assert.equal(menuChecks.get("選択時に最前面へ移動"), true);
   titledActions.get("選択時に最前面へ移動")!();
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(savedSettings?.frontOnSelect, false);
-  lifecycleView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(lifecycleView);
   assert.equal(menuChecks.get("選択時に最前面へ移動"), false);
   assert.equal(await vm.runInContext(`(async () => {
     const restored = new module.exports.default();
@@ -710,7 +739,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     ["左右反転", "horizontal flip"],
     ["上下反転", "vertical flip"],
   ]) {
-    lifecycleView.onPaneMenu(new MenuStub(), "more-options");
+    openPurMenu(lifecycleView);
     const before = lifecycleView.editor.snapshot();
     assert.ok(titledActions.has(title), `${expectedLabel} is available in the PUR operation menu`);
     titledActions.get(title)!();
@@ -1014,7 +1043,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   const vaultJpeg = new FakeTFile("assets/added.jpg");
   new FakeTFile("assets/unsupported.txt");
   liveFiles.set(vaultPng.path, Uint8Array.from(png).buffer);
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   titledActions.get("保管庫から画像を追加")!();
   assert.ok(imagePicker);
   assert.ok(imagePicker.getItems().includes(vaultPng) && imagePicker.getItems().includes(vaultJpeg));
@@ -1028,7 +1057,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal(deletePrevented, true);
   assert.equal(imageView.editor.snapshot().length, 3);
   imageView.editor.undo();
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   titledActions.get("選択した画像を削除")!();
   assert.equal(imageView.editor.snapshot().length, 3);
   imageView.editor.undo();
@@ -1036,12 +1065,12 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal(imageView.editor.snapshot().length, 3);
   imageView.editor.undo();
   imageKeys({ target: imageCanvas, key: "v", ctrlKey: true, preventDefault: () => assert.fail("native Ctrl+V was blocked") });
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   titledActions.get("閲覧モードへ")!();
   paste({ target: imageCanvas, clipboardData, preventDefault: () => assert.fail("read-only paste was intercepted") });
   imageKeys({ target: imageCanvas, key: "Delete", preventDefault: () => assert.fail("read-only Delete was intercepted") });
   assert.equal(imageView.editor.snapshot().length, 4);
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   titledActions.get("編集モードへ")!();
   const invalidFile = { size: 4, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
   drop({ clientX: 0, clientY: 0, dataTransfer: { files: [invalidFile] }, preventDefault() {}, stopPropagation() {} });
@@ -1087,7 +1116,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   ] as const;
   for (const id of [undefined, pasted.id]) {
     imageView.editor.select(id);
-    imageView.onPaneMenu(new MenuStub(), "more-options");
+    openPurMenu(imageView);
     for (const [title] of alignments) assert.equal(menuDisabled.get(title), true);
   }
   imageView.editor.setItem(pasted.id, [0, 3, -2, 0, 100, -200]);
@@ -1099,12 +1128,12 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   const groupBefore = imageView.editor.snapshot();
   const selectedBounds = transformedBounds(groupBefore.filter(entry =>
     entry.id === pasted.id || entry.id === dropped.id).map(entry => entry.content));
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   assert.equal(menuDisabled.get("90°時計回りに回転"), false, "group rotation is available");
   assert.equal(menuDisabled.get("左右反転"), true, "group reflection is not part of this release");
   assert.equal(menuDisabled.get("選択した画像を削除"), false);
   for (const [title, coordinate] of alignments) {
-    imageView.onPaneMenu(new MenuStub(), "more-options");
+    openPurMenu(imageView);
     assert.equal(menuDisabled.get(title), false);
     titledActions.get(title)!();
     const aligned = imageView.editor.snapshot();
@@ -1143,14 +1172,14 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     }
   }
   assert.deepEqual(imageView.editor.snapshot(), keysBefore);
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   titledActions.get("閲覧モードへ")!();
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   for (const [title] of alignments) assert.equal(menuDisabled.get(title), true);
   titledActions.get("編集モードへ")!();
   await imageView.savePurCurrent();
   const preAlignmentFile = new Uint8Array(liveFiles.get("boards/images.pur")!).slice();
-  imageView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(imageView);
   titledActions.get("右端揃え")!();
   const groupAfter = imageView.editor.snapshot();
   assert.equal(imageView.editor.dirty, true);
@@ -1243,7 +1272,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     await imageView.importQueue;
     const vaultImage = new FakeTFile(`assets/new.${extension}`);
     liveFiles.set(vaultImage.path, Uint8Array.from(data).buffer);
-    imageView.onPaneMenu(new MenuStub(), "more-options");
+    openPurMenu(imageView);
     titledActions.get("保管庫から画像を追加")!();
     assert.ok(imagePicker!.getItems().includes(vaultImage));
     imagePicker!.onChooseItem(vaultImage);
@@ -1299,21 +1328,206 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.match(diagnosticOutputs[diagnosticOutputs.length - 1]!.value, /frame drawn/);
   assert.equal(liveFiles.get(savedImageFile.path), savedImageBytes, "opening PUR does not rewrite its bytes");
   await reopenedView.onClose();
+  const groupedView = createView({});
+  const groupedFile = new FakeTFile("boards/groups.pur");
+  const groupedFixture = await groupFixture(), mixedDb = new SQL.Database(extractDatabase(groupedFixture));
+  let groupedOriginal: Uint8Array;
+  try {
+    mixedDb.run(`INSERT INTO items(id,parent,z) VALUES(200,-1,15),(201,-1,25);
+      INSERT INTO items_notes(id,text) VALUES(200,'preserve');
+      INSERT INTO items_drawings(id) VALUES(201)`);
+    groupedOriginal = wrapDatabase(groupedFixture, mixedDb.export());
+  } finally { mixedDb.close(); }
+  liveFiles.set(groupedFile.path, Uint8Array.from(groupedOriginal).buffer);
+  await groupedView.onOpen();
+  await groupedView.setState({ file: groupedFile.path });
+  activeView = groupedView;
+  assert.equal(groupedView.editor.snapshot().length, 7, "shipped plugin models images and group backgrounds");
+  const groupedCanvas = groupedView.contentEl.children[3];
+  const groupedPointer = (type: string, point: { x: number; y: number }, modifiers = {}) => {
+    const camera = groupedView.renderer.camera;
+    canvasHandlers.get(groupedCanvas)!.get(type)!({ type, target: groupedCanvas, pointerId: 1,
+      pointerType: "mouse", button: 0, ...modifiers,
+      clientX: point.x * camera.scale + camera.x, clientY: point.y * camera.scale + camera.y,
+      preventDefault() {} });
+  };
+  const nestedImage = groupedView.editor.snapshot().find(entry => entry.id === 2)!;
+  const nestedCenter = imageCenter(nestedImage.content);
+  groupedView.editor.select(100);
+  openPurMenu(groupedView);
+  assert.equal(menuDisabled.get("グループの内部を編集"), false);
+  titledActions.get("グループの内部を編集")!();
+  assert.equal(groupedView.editor.editingParent, 100);
+  groupedView.editor.select(110);
+  openPurMenu(groupedView);
+  titledActions.get("グループの内部を編集")!();
+  assert.equal(groupedView.editor.editingParent, 110);
+  groupedPointer("pointerdown", nestedCenter, { ctrlKey: true });
+  groupedPointer("pointerup", nestedCenter, { ctrlKey: true });
+  assert.equal(groupedView.editor.selectedId, 2, "nested image is directly hit-testable in world coordinates");
+  const initialGroup = groupedView.editor.snapshot();
+  groupedPointer("pointerdown", nestedCenter);
+  const movedCenter = { x: nestedCenter.x + 45, y: nestedCenter.y - 23 };
+  groupedPointer("pointermove", movedCenter);
+  groupedPointer("pointerup", movedCenter);
+  const movedGroup = groupedView.editor.snapshot();
+  const movedNested = movedGroup.find(entry => entry.id === 2)!;
+  assert.ok(Math.abs(movedNested.item[4] - nestedImage.item[4] - 45) < 1e-8);
+  assert.ok(Math.abs(movedNested.item[5] - nestedImage.item[5] + 23) < 1e-8);
+  for (const entry of movedGroup.filter(entry => entry.id !== 2 && !entry.content.group))
+    assert.deepEqual(entry, initialGroup.find(before => before.id === entry.id));
+  await new Promise(resolve => setTimeout(resolve, 3200));
+  assert.equal(groupedView.editor.dirty, false, "nested image movement uses idle autosave");
+  const groupedSaved = await parsePur(new Uint8Array(liveFiles.get(groupedFile.path)!));
+  for (const expected of movedGroup) {
+    const actual = [...groupedSaved.images, ...groupedSaved.groups ?? []].find(image => image.id === expected.id)!;
+    actual.item.forEach((value, i) => assert.ok(Math.abs(value - expected.item[i]) < 1e-8));
+    assert.equal(actual.parent?.id, expected.content.parent?.id);
+    assert.deepEqual(actual.data, Uint8Array.from(expected.content.data));
+  }
+  const groupBackups = (savedSettings?.backups as Array<{ source: string; path: string }>)
+    .filter(record => record.source === groupedFile.path);
+  assert.equal(groupBackups.length, 1);
+  assert.deepEqual(new Uint8Array(savedFiles.get(groupBackups[0].path)!), groupedOriginal);
+  groupedView.editor.undo();
+  assert.deepEqual(groupedView.editor.snapshot(), initialGroup, "nested world movement undoes as one operation");
+  groupedView.editor.redo();
+  assert.deepEqual(groupedView.editor.snapshot(), movedGroup);
+  openPurMenu(groupedView);
+  titledActions.get("親の階層へ戻る")!();
+  openPurMenu(groupedView);
+  titledActions.get("親の階層へ戻る")!();
+  assert.equal(groupedView.editor.editingParent, -1, "tablet menu returns through nested parents");
+  groupedView.editor.select(100);
+  groupedView.editor.toggleSelection(3);
+  openPurMenu(groupedView);
+  assert.equal(menuDisabled.get("右端揃え"), false);
+  titledActions.get("右端揃え")!();
+  await groupedView.savePurCurrent();
+  const alignedGroups = await parsePur(new Uint8Array(liveFiles.get(groupedFile.path)!));
+  const bounds = [...alignedGroups.images, ...alignedGroups.groups ?? []]
+    .filter(image => [100, 3].includes(image.id)).map(image => transformedBounds([image]));
+  assert.ok(bounds.every(bound => Math.abs(bound.x + bound.width - bounds[0].x - bounds[0].width) < 1e-8),
+    "alignment works on a group and a root image without flattening");
+  groupedView.renderer.editGroup(100);
+  groupedView.renderer.editGroup(110);
+  groupedView.editor.select(2);
+  openPurMenu(groupedView);
+  titledActions.get("選択した画像を削除")!();
+  await groupedView.savePurCurrent();
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get(groupedFile.path)!))).images.some(image => image.id === 2), false);
+  groupedView.editor.undo();
+  await groupedView.savePurCurrent();
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get(groupedFile.path)!))).images.find(image => image.id === 2)!.parent!.id, 110,
+    "Undo after saving a deletion restores the exact nested parent");
+  groupedView.renderer.parentGroup(); groupedView.renderer.parentGroup();
+  groupedView.editor.selectIds([100, 3]);
+  openPurMenu(groupedView);
+  const beforeGroupErrors = loggedErrors.length;
+  titledActions.get("選択項目をグループ化")!();
+  assert.equal(loggedErrors.length, beforeGroupErrors, "unrelated notes and drawings do not trigger the global structure guard");
+  const newGroupId = groupedView.editor.selectedId!;
+  assert.ok(groupedView.editor.selected!.group);
+  openPurMenu(groupedView);
+  titledActions.get("グループ背景色を変更")!();
+  const colorModalInput = inputs[inputs.length - 1];
+  colorModalInput.value = "#123456";
+  modalButtons.get("色を適用")!();
+  await groupedView.savePurCurrent();
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get(groupedFile.path)!)))
+    .groups!.find(image => image.id === newGroupId)!.group!.color, "#ff123456");
+  const beforeMixed = new SQL.Database(extractDatabase(groupedOriginal));
+  const afterMixed = new SQL.Database(extractDatabase(new Uint8Array(liveFiles.get(groupedFile.path)!)));
+  try {
+    for (const query of ["SELECT * FROM items WHERE id IN (200,201) ORDER BY id",
+      "SELECT * FROM items_notes", "SELECT * FROM items_drawings"])
+      assert.deepEqual(afterMixed.exec(query), beforeMixed.exec(query));
+  } finally { beforeMixed.close(); afterMixed.close(); }
+  openPurMenu(groupedView);
+  titledActions.get("選択グループを解除")!();
+  await groupedView.savePurCurrent();
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get(groupedFile.path)!)))
+    .groups!.some(image => image.id === newGroupId), false);
+  groupedView.renderer.undo();
+  await groupedView.savePurCurrent();
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get(groupedFile.path)!)))
+    .groups!.find(image => image.id === newGroupId)!.group!.color, "#ff123456");
+  await groupedView.onClose();
   const menuView = createView({});
   const menuFile = new FakeTFile("boards/menu-imports.pur");
   liveFiles.set(menuFile.path, Uint8Array.from(fixture).buffer);
   await menuView.onOpen();
   await menuView.setState({ file: menuFile.path });
-  menuView.onPaneMenu(new MenuStub(), "more-options");
+  const categories = ["画像の追加", "編集", "整列", "グループ", "表示", "保存"];
+  const rootMenu = new MenuStub();
+  menuView.onPaneMenu(rootMenu, "more-options");
+  assert.deepEqual(rootMenu.items.map(item => item.title), categories,
+    "pane menu has exactly six categories without exposing leaf actions");
+  const expectedItems = [
+    ["クリップボードから貼り付け", "ストレージから画像を読み込む", "保管庫から画像を追加"],
+    ["元に戻す", "やり直す", "選択した画像を削除", "90°時計回りに回転", "90°反時計回りに回転", "左右反転", "上下反転"],
+    ["左端揃え", "右端揃え", "上端揃え", "下端揃え", "水平中央揃え", "垂直中央揃え"],
+    ["グループの内部を編集", "親の階層へ戻る", "選択項目をグループ化", "選択グループを解除", "グループ背景色を変更"],
+    ["全体表示", "拡大", "縮小", "閲覧モードへ", "選択時に最前面へ移動", "ビューを閉じる"],
+    ["保存（現在の .pur を上書き）", "別名 .pur 保存", "変更を破棄", "外部更新を再読込"],
+  ];
+  const beforeMenuNavigation = menuView.editor.snapshot();
+  let prematureRead = false;
+  ownerWindow.navigator.clipboard = { read: async () => { prematureRead = true; return []; } };
+  for (const [index, item] of rootMenu.items.entries()) {
+    item.callback!({ clientX: 25, clientY: 40, pointerType: "touch" });
+    const child = shownMenus[shownMenus.length - 1];
+    assert.deepEqual(child.items.map(entry => entry.title),
+      ["PUR操作へ戻る", categories[index], ...expectedItems[index]]);
+    assert.deepEqual({ ...child.position }, { x: 0, y: 0 }, "pane submenu uses its fixed view anchor");
+    assert.equal(child.doc, menuView.contentEl.ownerDocument, "submenu uses the view's document");
+    assert.equal(menuDisabled.get(categories[index]), true, "child heading is not an executable action");
+    child.items[0].callback!({ key: "Enter" });
+    const back = shownMenus[shownMenus.length - 1];
+    assert.deepEqual(back.items.map(entry => entry.title), categories, "back restores only the root categories");
+    assert.deepEqual({ ...back.position }, { x: 0, y: 0 }, "keyboard navigation anchors at the canvas");
+  }
+  assert.equal(prematureRead, false, "category navigation never reads the clipboard");
+  assert.deepEqual(menuView.editor.snapshot(), beforeMenuNavigation, "navigation leaves selection and placement unchanged");
+  ownerWindow.navigator.clipboard = undefined;
+  headerActions.get("PUR操作（保存、元に戻す、全体表示）")!({ clientX: 25, clientY: 40 });
+  assert.deepEqual(shownMenus[shownMenus.length - 1].items.map(item => item.title), categories,
+    "header action uses the same categorized menu");
+  const checkAnchor = (anchor: { x: number; y: number }) => {
+    for (let i = 0; i < 3; i++) {
+      const root = shownMenus[shownMenus.length - 1];
+      assert.deepEqual({ ...root.position }, anchor);
+      assert.equal(root.doc, menuView.contentEl.ownerDocument);
+      root.items[0].callback!({ clientX: 400 + i * 50, clientY: 600 + i * 50, pointerType: "touch" });
+      const child = shownMenus[shownMenus.length - 1];
+      assert.deepEqual({ ...child.position }, anchor, "child keeps the opening anchor, not the tapped row");
+      assert.equal(child.doc, root.doc);
+      child.items[0].callback!(i === 0 ? { key: "Enter" } : { clientX: 800, clientY: 900 });
+      const back = shownMenus[shownMenus.length - 1];
+      assert.deepEqual({ ...back.position }, anchor, "back never accumulates coordinate drift");
+      assert.equal(back.doc, root.doc);
+    }
+  };
+  checkAnchor({ x: 25, y: 40 });
+  menuView.runPurAction("menu");
+  checkAnchor({ x: 12, y: 12 });
   const menuCanvas = menuView.contentEl.children[3];
   titledActions.delete("クリップボードから貼り付け");
-  domHandlers.get(menuCanvas)!.get("contextmenu")!({ preventDefault() {} });
+  domHandlers.get(menuCanvas)!.get("contextmenu")!({ clientX: 0, clientY: 70, preventDefault() {} });
+  assert.ok(!titledActions.has("クリップボードから貼り付け"), "imports are nested, not duplicated at root");
+  checkAnchor({ x: 0, y: 70 });
+  assert.deepEqual(shownMenus[shownMenus.length - 1].items.map(item => item.title), categories);
+  titledActions.get("画像の追加")!({ clientX: 10, clientY: 20 });
   assert.ok(titledActions.has("クリップボードから貼り付け"), "right-click shares image import actions");
   titledActions.delete("ストレージから画像を読み込む");
   domHandlers.get(menuCanvas)!.get("pointerdown")!({
     pointerType: "touch", isPrimary: true, clientX: 10, clientY: 20,
   });
   await new Promise(resolve => setTimeout(resolve, 700));
+  assert.ok(!titledActions.has("ストレージから画像を読み込む"));
+  checkAnchor({ x: 10, y: 20 });
+  assert.deepEqual(shownMenus[shownMenus.length - 1].items.map(item => item.title), categories);
+  titledActions.get("画像の追加")!({ clientX: 10, clientY: 20, pointerType: "touch" });
   assert.ok(titledActions.has("ストレージから画像を読み込む"), "tablet long press shares image import actions");
   domHandlers.get(menuCanvas)!.get("pointerup")!({});
   assert.equal(menuDisabled.get("クリップボードから貼り付け"), false);
@@ -1431,14 +1645,14 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     const saved = menuSaved.images.find(image => image.id === state.id)!;
     assert.deepEqual(saved.data, Uint8Array.from(state.content.data));
   }
-  menuView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(menuView);
   titledActions.get("閲覧モードへ")!();
-  menuView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(menuView);
   assert.equal(menuDisabled.get("クリップボードから貼り付け"), true);
   assert.equal(menuDisabled.get("ストレージから画像を読み込む"), true);
   ownerWindow.navigator.clipboard = { read: async () => assert.fail("read-only menu must not read clipboard") };
   await menuPaste();
-  menuView.onPaneMenu(new MenuStub(), "more-options");
+  openPurMenu(menuView);
   titledActions.get("編集モードへ")!();
   let resolveClipboard: ((items: []) => void) | undefined;
   ownerWindow.navigator.clipboard = { read: () => new Promise(resolve => { resolveClipboard = resolve; }) };

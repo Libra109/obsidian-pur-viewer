@@ -14,7 +14,7 @@ import { svgDataUrl } from "./svg";
 import { disposeHeicWorker, setHeicFallbackHandler } from "./heic";
 
 const VIEW_TYPE = "lazyref-pur-view";
-const BUILD_ID = "0.15.0";
+const BUILD_ID = "0.18.1";
 const IMAGE_TYPES = ["image/heic", "image/heif", "image/svg+xml", "image/gif", "image/webp",
   "image/bmp", "image/x-ms-bmp", "image/jpeg", "image/png"];
 const DEFAULT_AUTOSAVE_SECONDS = 3;
@@ -35,6 +35,8 @@ function sameSnapshot(
   return left.length === right.length && left.every((item, index) => {
     const other = right[index];
     return item.id === other.id && item.z === other.z &&
+      item.content.parent?.id === other.content.parent?.id &&
+      item.content.group?.color === other.content.group?.color &&
       item.item.every((value, i) => value === other.item[i]);
   });
 }
@@ -106,6 +108,24 @@ class CopyNameModal extends Modal {
     });
   }
   onClose(): void { this.resolveResult?.(undefined); this.resolveResult = undefined; }
+}
+
+class GroupColorModal extends Modal {
+  constructor(app: App, private readonly color: string | null,
+    private readonly apply: (color: string | null) => void) { super(app); }
+  onOpen(): void {
+    this.setTitle("グループの背景色");
+    const input = this.contentEl.createEl("input", { type: "color",
+      value: this.color ? `#${this.color.slice(3)}` : "#202020" });
+    input.setAttribute("aria-label", "グループ背景色");
+    new ButtonComponent(this.contentEl).setButtonText("キャンセル").onClick(() => this.close());
+    new ButtonComponent(this.contentEl).setButtonText("既定色に戻す").onClick(() => { this.apply(null); this.close(); });
+    new ButtonComponent(this.contentEl).setButtonText("色を適用").onClick(() => {
+      if (!/^#[\da-f]{6}$/i.test(input.value)) { new Notice("背景色の形式が不正です"); return; }
+      this.apply(`#${this.color?.slice(1, 3) ?? "ff"}${input.value.slice(1)}`);
+      this.close();
+    });
+  }
 }
 
 class VaultImageModal extends FuzzySuggestModal<TFile> {
@@ -345,49 +365,105 @@ class PurView extends FileView {
 
   private showPurMenu(event: MouseEvent): void {
     const menu = new Menu();
-    this.populatePurMenu(menu);
-    menu.showAtMouseEvent(event);
+    const anchor = { x: event.clientX, y: event.clientY };
+    this.populatePurMenu(menu, undefined, anchor);
+    menu.showAtPosition(anchor, this.contentEl.ownerDocument);
   }
 
-  private populatePurMenu(menu: Menu): void {
-    menu.addItem(item => item.setTitle("選択時に最前面へ移動")
-      .setChecked(this.purPlugin.frontOnSelect)
-      .onClick(() => void this.purPlugin.setPurFrontOnSelect(!this.purPlugin.frontOnSelect)));
+  private populatePurMenu(menu: Menu, category?: string, anchor?: Point): void {
+    // Pane menus provide no opening event or public position; use a stable view anchor.
+    const rect = this.canvas?.getBoundingClientRect() ?? this.contentEl.getBoundingClientRect();
+    const position = anchor ?? { x: rect.left, y: rect.top };
+    const show = (next: string | undefined) => {
+      const child = new Menu();
+      this.populatePurMenu(child, next, position);
+      child.showAtPosition(position, this.contentEl.ownerDocument);
+    };
+    if (category) {
+      menu.addItem(item => item.setTitle("PUR操作へ戻る").setIcon("arrow-left")
+        .onClick(() => show(undefined)));
+      menu.addItem(item => item.setTitle(category).setDisabled(true));
+    }
+    // The public API has no submenu method; open a child Menu on click/tap instead.
+    const section = (title: string, populate: () => void) => {
+      if (category === title) populate();
+      else if (!category) menu.addItem(item => item.setTitle(title).setIcon("chevron-right")
+        .onClick(() => show(title)));
+    };
     const action = (title: string, callback: () => void, disabled = false) =>
       menu.addItem(item => item.setTitle(title).setDisabled(disabled).onClick(callback));
-    action("保存（現在の .pur を上書き）", () => void this.savePurCurrent(), !this.sourceBytes || this.saving);
-    action("別名 .pur 保存", () => void this.savePurCopy(), !this.sourceBytes || this.saving);
-    action("クリップボードから貼り付け", () => this.pasteClipboardImage(), !this.canAddImages);
-    action("ストレージから画像を読み込む", () => this.chooseStorageImages(), !this.canAddImages);
-    action("保管庫から画像を追加", () => this.chooseVaultImage(), !this.canAddImages);
-    action("選択した画像を削除", () => this.renderer?.removeSelected(), !this.renderer?.canRemoveSelected);
-    action("左端揃え", () => this.renderer?.alignSelected("left"), !this.renderer?.canAlignSelected);
-    action("右端揃え", () => this.renderer?.alignSelected("right"), !this.renderer?.canAlignSelected);
-    action("上端揃え", () => this.renderer?.alignSelected("top"), !this.renderer?.canAlignSelected);
-    action("下端揃え", () => this.renderer?.alignSelected("bottom"), !this.renderer?.canAlignSelected);
-    action("水平中央揃え", () => this.renderer?.alignSelected("horizontal-center"), !this.renderer?.canAlignSelected);
-    action("垂直中央揃え", () => this.renderer?.alignSelected("vertical-center"), !this.renderer?.canAlignSelected);
-    action("元に戻す", () => this.renderer?.undo(), !this.editor?.canUndo);
-    action("やり直す", () => this.renderer?.redo(), !this.editor?.canRedo);
-    action("90°時計回りに回転", () => this.renderer?.rotateSelected(Math.PI / 2),
-      !this.renderer?.canRotateSelected);
-    action("90°反時計回りに回転", () => this.renderer?.rotateSelected(-Math.PI / 2),
-      !this.renderer?.canRotateSelected);
-    action("左右反転", () => this.renderer?.flipSelected("horizontal"),
-      !this.renderer?.canTransformSelected);
-    action("上下反転", () => this.renderer?.flipSelected("vertical"),
-      !this.renderer?.canTransformSelected);
-    action("全体表示", () => this.renderer?.fit());
-    action("拡大", () => this.renderer?.zoom(1.25));
-    action("縮小", () => this.renderer?.zoom(0.8));
-    action(this.editButton?.dataset.editing === "true" ? "閲覧モードへ" : "編集モードへ", () => this.toggleEditMode());
-    action("変更を破棄", () => void this.confirmDiscard(), !this.editor?.dirty);
-    action("外部更新を再読込", () => void this.confirmExternalReload());
-    if (this.backupPath) {
-      const backup = this.backupPath;
-      action("直前の復旧用コピーの場所", () => new Notice(`復旧用コピー: ${backup}`, 15000));
-    }
-    action("ビューを閉じる", () => void this.closeView());
+    section("画像の追加", () => {
+      action("クリップボードから貼り付け", () => this.pasteClipboardImage(), !this.canAddImages);
+      action("ストレージから画像を読み込む", () => this.chooseStorageImages(), !this.canAddImages);
+      action("保管庫から画像を追加", () => this.chooseVaultImage(), !this.canAddImages);
+    });
+    section("編集", () => {
+      action("元に戻す", () => this.renderer?.undo(), !this.editor?.canUndo);
+      action("やり直す", () => this.renderer?.redo(), !this.editor?.canRedo);
+      action(this.editor?.selectedImages.some(image => image.group)
+        ? "選択した項目を削除（グループの内部も削除）" : "選択した画像を削除",
+      () => this.renderer?.removeSelected(), !this.renderer?.canRemoveSelected);
+      action("90°時計回りに回転", () => this.renderer?.rotateSelected(Math.PI / 2),
+        !this.renderer?.canRotateSelected);
+      action("90°反時計回りに回転", () => this.renderer?.rotateSelected(-Math.PI / 2),
+        !this.renderer?.canRotateSelected);
+      action("左右反転", () => this.renderer?.flipSelected("horizontal"),
+        !this.renderer?.canTransformSelected);
+      action("上下反転", () => this.renderer?.flipSelected("vertical"),
+        !this.renderer?.canTransformSelected);
+    });
+    section("整列", () => {
+      action("左端揃え", () => this.renderer?.alignSelected("left"), !this.renderer?.canAlignSelected);
+      action("右端揃え", () => this.renderer?.alignSelected("right"), !this.renderer?.canAlignSelected);
+      action("上端揃え", () => this.renderer?.alignSelected("top"), !this.renderer?.canAlignSelected);
+      action("下端揃え", () => this.renderer?.alignSelected("bottom"), !this.renderer?.canAlignSelected);
+      action("水平中央揃え", () => this.renderer?.alignSelected("horizontal-center"), !this.renderer?.canAlignSelected);
+      action("垂直中央揃え", () => this.renderer?.alignSelected("vertical-center"), !this.renderer?.canAlignSelected);
+    });
+    section("グループ", () => {
+      if (this.editor?.images.some(image => image.group))
+        action(this.editor.editingParent === -1 ? "編集階層: ルート" : `編集階層: グループ ${this.editor.editingParent}`, () => {}, true);
+      const group = this.editor?.selected;
+      const editing = this.editButton?.dataset.editing === "true";
+      action("グループの内部を編集", () => this.renderer?.editGroup(), !editing || !group?.group);
+      action("親の階層へ戻る", () => this.renderer?.parentGroup(),
+        !editing || !this.editor || this.editor.editingParent === -1);
+      action("選択項目をグループ化", () => this.renderer?.groupSelected(),
+        !editing || (this.editor?.selectedImages.length ?? 0) < 2);
+      action("選択グループを解除", () => this.renderer?.ungroupSelected(), !editing || !group?.group);
+      action("グループ背景色を変更", () => {
+        if (!group?.group) return;
+        const editor = this.editor, loadId = this.loadId;
+        this.renderer?.finishPendingEdit();
+        new GroupColorModal(this.app, group.group.color, color => {
+          if (loadId !== this.loadId || editor !== this.editor || editor?.selectedId !== group.id ||
+              this.editButton?.dataset.editing !== "true") {
+            new Notice("編集対象または選択が変わったため背景色を変更しません"); return;
+          }
+          this.renderer?.groupColor(color);
+        }).open();
+      }, !editing || !group?.group);
+    });
+    section("表示", () => {
+      action("全体表示", () => this.renderer?.fit());
+      action("拡大", () => this.renderer?.zoom(1.25));
+      action("縮小", () => this.renderer?.zoom(0.8));
+      action(this.editButton?.dataset.editing === "true" ? "閲覧モードへ" : "編集モードへ", () => this.toggleEditMode());
+      menu.addItem(item => item.setTitle("選択時に最前面へ移動")
+        .setChecked(this.purPlugin.frontOnSelect)
+        .onClick(() => void this.purPlugin.setPurFrontOnSelect(!this.purPlugin.frontOnSelect)));
+      action("ビューを閉じる", () => void this.closeView());
+    });
+    section("保存", () => {
+      action("保存（現在の .pur を上書き）", () => void this.savePurCurrent(), !this.sourceBytes || this.saving);
+      action("別名 .pur 保存", () => void this.savePurCopy(), !this.sourceBytes || this.saving);
+      action("変更を破棄", () => void this.confirmDiscard(), !this.editor?.dirty);
+      action("外部更新を再読込", () => void this.confirmExternalReload());
+      if (this.backupPath) {
+        const backup = this.backupPath;
+        action("直前の復旧用コピーの場所", () => new Notice(`復旧用コピー: ${backup}`, 15000));
+      }
+    });
   }
 
   private get canAddImages(): boolean {
@@ -528,9 +604,10 @@ class PurView extends FileView {
     else if (action === "fit") this.renderer?.fit();
     else {
       const menu = new Menu();
-      this.populatePurMenu(menu);
       const rect = this.contentEl.getBoundingClientRect();
-      menu.showAtPosition({ x: rect.left + 12, y: rect.top + 12 });
+      const anchor = { x: rect.left + 12, y: rect.top + 12 };
+      this.populatePurMenu(menu, undefined, anchor);
+      menu.showAtPosition(anchor, this.contentEl.ownerDocument);
     }
   }
 
@@ -618,7 +695,7 @@ class PurView extends FileView {
       this.status.setText("PURデータを解析中…");
       const board = await parsePur(bytes);
       loading.signal.throwIfAborted();
-      const bounds = boardBounds(board.images);
+      const bounds = boardBounds([...board.images, ...board.groups ?? []]);
       this.trace("decoding images");
       this.status.setText("画像を展開中…");
       const images = await decodeImages(board.images, loading.signal);
@@ -630,7 +707,7 @@ class PurView extends FileView {
         try { this.onEditorChange(); }
         catch (error) { this.reportFailure("編集状態の更新", error); }
       },
-        board.maxHiddenRootZ, board.frontmostRootId, board.maxItemId);
+        board.maxHiddenRootZ, board.frontmostRootId, board.maxItemId, board.groups, board.structureIssue, board.hiddenItems);
       this.trace("renderer initialized; waiting for frame");
       try {
         this.renderer = new BoardRenderer(this.canvas, images, bounds, this.editor,
@@ -933,8 +1010,10 @@ class PurView extends FileView {
       const mode = this.editButton?.dataset.editing === "true" ? "編集モード" : "閲覧モード";
       const selection = editor?.selectedImages.length ? ` / 選択中: ${editor.selectedImages.length}枚` : "";
       const dirty = editor?.dirty ? " / 未保存変更" : "";
+      const hierarchy = editor?.editingParent !== undefined && editor.editingParent !== -1
+        ? ` / グループ ${editor.editingParent} の内部（PUR操作から親へ戻る）` : "";
       const copy = this.savedCopy ? ` / 保存済みコピー: ${this.savedCopy}（保存時の配置）` : "";
-      this.editStatus.setText(`${mode}${selection}${dirty}${copy}`);
+      this.editStatus.setText(`${mode}${hierarchy}${selection}${dirty}${copy}`);
     }
     if (this.alerts) {
       const messages = [

@@ -54,6 +54,53 @@ and `application_id = 940753918` (`0x3812C3FE`). Seven tables:
 
 Blob-typed columns don't hold SQLite BLOBs — see the storage quirk below.
 
+### Group hierarchy and image placement
+
+Read-only comparisons of supplied 2.1 scenes, including a nested scene and its PureRef screenshot,
+show that `items.parent` references a group item; `-1` denotes the root.
+An item's `transform` is local to its parent, not a flattened world placement.
+Using column-vector affine matrices, an image pixel is placed by
+`ancestor transforms × items.transform × items_images.image_transform`.
+`image_bounds` clips in the image item's coordinate system, before the image-local transform.
+The nested example's opposing group rotations cancel in the displayed child images.
+
+Stacking is ordered among siblings by `z`, then the exact rational `sort_order`.
+A group's descendants stay within that group's stacking position relative to its siblings.
+The plugin uses the item ID as a deterministic fallback when both keys tie.
+Editing a child writes only its parent-local placement; group transforms and parent references
+are preserved. Child front promotion is scoped to its immediate parent.
+
+The observed group rows have `opacity=1`, `locked=0`, and `lock_mode=1`.
+Other group opacity/lock settings have not been verified and the plugin warns and skips their
+descendant images instead of guessing.
+No separate group clipping-path or visibility column exists in the observed schema.
+
+An additional before/grouped/color-changed/ungrouped comparison confirmed that creating a group
+adds one `items` row and one `items_groups` row and changes the children's parent and local transforms,
+without changing their world placements or image payloads. Changing the background from black to red
+changed only `items_groups.background_color` (`#ff000000` to `#ffd23131`).
+Colors use `#AARRGGBB`, not CSS's `#RRGGBBAA`.
+Ungrouping removes the group rows, promotes the children to the group's parent, composes the group
+transform into their local placements, and can rewrite sibling sort keys.
+
+The supplied screenshots match a background based on child bounds in group-local coordinates,
+expanded by approximately 10 units on each side with an approximately 8-unit corner radius.
+These are the plugin's rendering constants, not independently stored or universally verified PureRef
+settings. Nested child backgrounds contribute to their parent's bounds. A null background uses the
+plugin default color for display and remains null unless explicitly changed.
+New plugin groups use a centered uniform transform with the longest world extent normalized to
+200 local units; the exact normalization PureRef chooses for new groups is not claimed to match.
+Grouping inherits the frontmost selected sibling's z and original sort-order cell without
+renumbering other siblings. Ungrouping assigns distinct child z values inside the group's sibling
+slot, accounting for undisplayed notes and drawings. When all siblings are displayed, equal-z
+collisions can be resolved by renumbering that level; otherwise ambiguous collisions or insufficient
+floating-point spacing are refused without editing the scene.
+By explicit user choice, grouping places the new subtree at the frontmost selected sibling's position,
+keeping selected siblings' mutual order; non-selected siblings between them can change their
+front/back relationship to selected items. Unrelated notes and drawings are preserved cell-for-cell
+and do not prevent structural edits. Unsupported descendants/references, unrecognized omitted items,
+and structural edits in scenes with unknown tables are refused rather than destroyed.
+
 ### Writing files that match PureRef byte-for-byte
 
 Small details decide whether two writers produce identical files. `purcore` reproduces

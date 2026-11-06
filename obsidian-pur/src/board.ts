@@ -22,22 +22,106 @@ export interface BoardImage {
   width: number;
   height: number;
   item: Matrix;
+  localItem?: Matrix;
+  localItemWorld?: Matrix;
   image: Matrix;
   clip?: Clip;
   opacity: number;
   z: number;
+  /** Original sibling rank, not the flattened draw-list index. */
+  stackOrder?: number;
+  /** Group items share transform geometry but have no encoded bitmap. */
+  group?: {
+    color: string | null;
+    unsupported?: string;
+    stored?: StoredRow;
+    sortOrder?: { value: SqlValue; text: boolean };
+  };
+  parent?: {
+    id: number;
+    transform: Matrix;
+    ancestors: { id: number; z: number; order: number }[];
+    hiddenMaxZ: number;
+    frontmostId?: number;
+  };
   stored?: { item: StoredRow; imageItem: StoredRow; source: StoredRow };
 }
 export interface Board {
   version: string;
   images: BoardImage[];
+  groups?: BoardImage[];
+  structureIssue?: string;
+  hiddenItems?: { id: number; parent: number; z: number }[];
   warnings: string[];
   maxRootZ?: number;
   maxHiddenRootZ?: number;
   frontmostRootId?: number;
   maxItemId?: number;
 }
+export function parentId(image: BoardImage): number { return image.parent?.id ?? -1; }
+
+export function rememberLocal(item: BoardImage, preserve = false): void {
+  if (!preserve) {
+    const inverse = item.parent ? invert(item.parent.transform) : IDENTITY;
+    check(inverse, "親の変換を逆変換できません");
+    item.localItem = multiply(inverse, item.item);
+  }
+  item.localItemWorld = [...item.item];
+}
+
+export function updateHierarchy(items: BoardImage[]): void {
+  const groups = new Map(items.filter(item => item.group).map(item => [item.id, item]));
+  const childrenByParent = new Map<number, BoardImage[]>();
+  for (const item of items) {
+    const siblings = childrenByParent.get(parentId(item)) ?? [];
+    siblings.push(item);
+    childrenByParent.set(parentId(item), siblings);
+  }
+  const visited = new Set<number>();
+  const update = (item: BoardImage, chain = new Set<number>()): void => {
+    if (visited.has(item.id)) return;
+    check(!chain.has(item.id) && chain.size < 64, "グループ階層が循環しているか深すぎます");
+    chain.add(item.id);
+    if (item.parent) {
+      const parent = groups.get(item.parent.id);
+      check(parent, "親グループがありません");
+      update(parent, chain);
+      item.parent = { ...item.parent, transform: [...parent.item],
+        ancestors: [...parent.parent?.ancestors ?? [],
+          { id: parent.id, z: parent.z, order: parent.stackOrder ?? 0 }] };
+    }
+    chain.delete(item.id);
+    visited.add(item.id);
+  };
+  items.forEach(item => update(item));
+  const measure = (group: BoardImage): void => {
+    const children = childrenByParent.get(group.id) ?? [];
+    for (const child of children) if (child.group) measure(child);
+    if (!children.length) { group.width = 20; group.height = 20; group.image = [1, 0, 0, 1, -10, -10]; return; }
+    const inverse = invert(group.item);
+    check(inverse, "グループの変換を逆変換できません");
+    const bounds = transformedBounds(children.map(child => ({ ...child, item: multiply(inverse, child.item) })));
+    group.width = bounds.width + 20;
+    group.height = bounds.height + 20;
+    group.image = [1, 0, 0, 1, bounds.x - 10, bounds.y - 10];
+  };
+  for (const group of groups.values()) if (!group.parent) measure(group);
+}
 export interface Bounds { x: number; y: number; width: number; height: number }
+
+export function compareImageStack(a: BoardImage, b: BoardImage, aOrder: number, bOrder: number): number {
+  if (!a.parent && !b.parent) return a.z - b.z ||
+    (a.stackOrder ?? aOrder) - (b.stackOrder ?? bOrder) || aOrder - bOrder;
+  aOrder = a.stackOrder ?? aOrder;
+  bOrder = b.stackOrder ?? bOrder;
+  const left = [...a.parent?.ancestors ?? [], { id: a.id, z: a.z, order: aOrder }];
+  const right = [...b.parent?.ancestors ?? [], { id: b.id, z: b.z, order: bOrder }];
+  for (let i = 0; i < Math.min(left.length, right.length); i++) {
+    if (left[i].id === right[i].id) continue;
+    return left[i].z - right[i].z || left[i].order - right[i].order || left[i].id - right[i].id;
+  }
+  return left.length - right.length;
+}
 
 export function multiply(a: Matrix, b: Matrix): Matrix {
   return [

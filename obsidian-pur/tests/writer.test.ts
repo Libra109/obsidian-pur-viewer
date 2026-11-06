@@ -48,7 +48,7 @@ test("2.1 copy preserves every unedited SQL cell, unknown tables, TEXT bytes and
     const before = source.slice();
     const board = await parsePur(source);
     assert.ok(board.warnings.some(warning => warning.includes("ノート")));
-    assert.ok(board.warnings.some(warning => warning.includes("グループ")));
+    assert.ok(board.groups?.some(group => group.id === 901));
     const placement = { id: board.images[0].id, item: [...board.images[0].item] as Matrix };
     placement.item[0] *= 1.5;
     placement.item[4] += 12.5;

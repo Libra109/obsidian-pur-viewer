@@ -1,12 +1,25 @@
 import SparkMD5 from "spark-md5";
 import type { Database, SqlValue } from "sql.js";
 import { check } from "./binary";
-import { BoardImage, Clip, imageMime, Matrix, StoredRow } from "./board";
+import { BoardImage, Clip, imageMime, invert, Matrix, multiply, parentId, StoredRow } from "./board";
 import { imageDimensions } from "./image-import";
 import { decodeTransform } from "./codecs";
 import { extractDatabase, MAX_FILE_BYTES, parsePur, sqlite } from "./parser";
 
 export interface Placement { id: number; item: Matrix; z?: number; content?: BoardImage }
+
+function localPlacement(item: Matrix, image: BoardImage): Matrix {
+  if (image.localItem && image.localItemWorld?.every((value, i) => value === item[i])) return image.localItem;
+  if (!image.parent) return item;
+  const inverse = invert(image.parent.transform);
+  check(inverse, "親グループの変換を逆変換できないため保存できません");
+  return multiply(inverse, item);
+}
+
+function samePlacement(expected: Matrix, actual: Matrix, grouped: boolean): boolean {
+  return expected.every((value, i) => value === actual[i] ||
+    grouped && Math.abs(value - actual[i]) <= 1e-10 * Math.max(1, Math.abs(value), Math.abs(actual[i])));
+}
 
 export function wrapDatabase(original: Uint8Array, database: Uint8Array): Uint8Array {
   extractDatabase(original);
@@ -92,7 +105,7 @@ function insertStoredRow(db: Database, table: string, row: StoredRow,
 export async function writePurCopy(original: Uint8Array, placements: Placement[],
   deletedIds: number[] = []): Promise<Uint8Array> {
   const board = await parsePur(original);
-  const supported = new Map(board.images.map(image => [image.id, image]));
+  const supported = new Map([...board.images, ...board.groups ?? []].map(image => [image.id, image]));
   const ids = new Set<number>();
   const SQL = await sqlite();
   const db = new SQL.Database(extractDatabase(original));
@@ -105,11 +118,64 @@ export async function writePurCopy(original: Uint8Array, placements: Placement[]
       "items_drawings", "metadata"]);
     const unknownTables = db.exec("SELECT name FROM sqlite_master WHERE type='table'")[0].values
       .some(([name]) => !knownTables.has(String(name)));
+    const hierarchyChanged = placements.some(placement => placement.content &&
+      (Boolean(placement.content.group) && !supported.has(placement.id) ||
+       supported.has(placement.id) && parentId(placement.content) !== parentId(supported.get(placement.id)!))) ||
+       deletedIds.some(id => supported.get(id)?.group);
+    check(!hierarchyChanged || !unknownTables,
+      "未知のテーブルによる参照を保持できるか確認できないためグループ作成、解除、削除は保存できません");
+    for (const placement of placements.filter(placement => placement.content?.group)) {
+      const group = placement.content!, before = supported.get(placement.id);
+      check(Number.isSafeInteger(placement.id) && placement.id >= 0 &&
+        Number.isFinite(placement.z), "グループの配置が不正です");
+      check(!(group.group!.unsupported || before?.group?.unsupported) || before &&
+        before.group?.color === group.group!.color && before.z === placement.z &&
+        parentId(before) === parentId(group) && samePlacement(before.item, placement.item, false),
+      "未対応の子要素または参照があるグループは編集保存できません");
+      if (!before) {
+        check(!db.exec(`SELECT id FROM items WHERE id=${placement.id}
+          UNION ALL SELECT id FROM items_images WHERE id=${placement.id}
+          UNION ALL SELECT id FROM items_groups WHERE id=${placement.id}
+          UNION ALL SELECT id FROM items_notes WHERE id=${placement.id}
+          UNION ALL SELECT id FROM items_drawings WHERE id=${placement.id}`).length, "追加グループIDが衝突しています");
+        if (group.stored && group.group!.stored) {
+          const row = group.stored.item, raw = row.values.transform;
+          const oldLocal = decodeTransform(row.textColumns.includes("transform") && raw instanceof Uint8Array
+            ? new TextDecoder("utf-8", { fatal: true }).decode(raw) : raw);
+          const overrides: Record<string, SqlValue> = { id: placement.id };
+          const changed = !samePlacement(oldLocal, localPlacement(placement.item, group), false);
+          if (changed) overrides.transform = storedTransform(localPlacement(placement.item, group));
+          if ((row.values.parent ?? -1) !== parentId(group)) overrides.parent = parentId(group);
+          if ((row.values.z ?? 0) !== placement.z) overrides.z = placement.z!;
+          insertStoredRow(db, "items", row, overrides, changed ? ["transform"] : []);
+          const subtype = group.group!.stored, color = subtype.values.background_color;
+          const oldColor = color instanceof Uint8Array ? new TextDecoder("utf-8", { fatal: true }).decode(color) : color;
+          insertStoredRow(db, "items_groups", subtype,
+            oldColor === group.group!.color ? {} : { background_color: group.group!.color });
+        } else {
+          db.run(`INSERT INTO items(id,parent,transform,sort_order,z,opacity,locked,comment,name)
+            VALUES(?,?,CAST(? AS TEXT),${!group.group!.sortOrder || group.group!.sortOrder.text ? "CAST(? AS TEXT)" : "?"},?,1,0,NULL,NULL)`,
+          [placement.id, parentId(group), storedTransform(localPlacement(placement.item, group)),
+            group.group!.sortOrder ? group.group!.sortOrder.value : storedOrder(placement.id), placement.z!]);
+          db.run("INSERT INTO items_groups(id,background_color,lock_mode) VALUES(?,?,1)",
+            [placement.id, group.group!.color]);
+        }
+      } else {
+        const changed = !samePlacement(localPlacement(before.item, before), localPlacement(placement.item, group), false) ||
+          parentId(group) !== parentId(before);
+        if (changed) db.run("UPDATE items SET parent=?,transform=CAST(? AS TEXT) WHERE id=?",
+          [parentId(group), storedTransform(localPlacement(placement.item, group)), placement.id]);
+        if (placement.z !== before.z) db.run("UPDATE items SET z=? WHERE id=?", [placement.z!, placement.id]);
+        if (group.group!.color !== before.group?.color)
+          db.run("UPDATE items_groups SET background_color=? WHERE id=?", [group.group!.color, placement.id]);
+      }
+    }
     const deleted = new Set<number>();
     for (const id of deletedIds) {
       check(supported.has(id) && !deleted.has(id) && !placements.some(placement => placement.id === id),
         "未対応または重複した画像項目は削除できません");
       deleted.add(id);
+      if (supported.get(id)!.group) continue;
       check(!db.exec(`SELECT id FROM items WHERE parent=${id} OR comment=${id}
         UNION ALL SELECT id FROM items_notes WHERE id=${id}
         UNION ALL SELECT id FROM items_groups WHERE id=${id}
@@ -129,6 +195,7 @@ export async function writePurCopy(original: Uint8Array, placements: Placement[]
       check(Number.isSafeInteger(placement.id) && placement.id >= 0 && !ids.has(placement.id),
         "未対応または重複した画像項目は保存できません");
       ids.add(placement.id);
+      if (placement.content?.group) continue;
       if (!before) {
         const image = placement.content;
         check(image && image.id === placement.id && imageMime(image.data) === image.mime,
@@ -158,9 +225,15 @@ export async function writePurCopy(original: Uint8Array, placements: Placement[]
           const oldTransform = decodeTransform(storedItem.textColumns.includes("transform") &&
             rawTransform instanceof Uint8Array ? new TextDecoder("utf-8", { fatal: true }).decode(rawTransform)
             : rawTransform);
-          const overrides: Record<string, SqlValue> = { id: placement.id };
-          const changedTransform = !oldTransform.every((value, i) => value === placement.item[i]);
-          if (changedTransform) overrides.transform = storedTransform(placement.item);
+          const overrides: Record<string, SqlValue> = { id: placement.id, parent: parentId(image) };
+          if (image.parent) {
+            check(db.exec(`SELECT i.id FROM items i JOIN items_groups g ON i.id=g.id WHERE i.id=${image.parent.id}`).length,
+            "復元画像の親グループを確認できません");
+          }
+          const oldWorld = image.parent ? multiply(image.parent.transform, oldTransform) : oldTransform;
+          const changedTransform = storedItem.values.parent !== parentId(image) ||
+            !oldWorld.every((value, i) => value === placement.item[i]);
+          if (changedTransform) overrides.transform = storedTransform(localPlacement(placement.item, image));
           if ((storedItem.values.z ?? 0) !== placement.z) overrides.z = placement.z;
           insertStoredRow(db, "items", storedItem, overrides, changedTransform ? ["transform"] : []);
           insertStoredRow(db, "items_images", image.stored.imageItem, {
@@ -172,8 +245,8 @@ export async function writePurCopy(original: Uint8Array, placements: Placement[]
           VALUES(?,?,?,?,?,NULL,1,NULL,?)`, [imageId, image.width, image.height, hash.end(),
           image.mime === "image/svg+xml" ? "SVG" : image.mime.slice(6).toUpperCase(), image.data]);
         db.run(`INSERT INTO items(id,parent,transform,sort_order,z,opacity,locked,comment,name)
-          VALUES(?,-1,CAST(? AS TEXT),CAST(? AS TEXT),?,?,0,NULL,NULL)`,
-        [placement.id, storedTransform(placement.item), storedOrder(placement.id), placement.z, image.opacity]);
+          VALUES(?,?,CAST(? AS TEXT),CAST(? AS TEXT),?,?,0,NULL,NULL)`,
+        [placement.id, parentId(image), storedTransform(localPlacement(placement.item, image)), storedOrder(placement.id), placement.z, image.opacity]);
         db.run(`INSERT INTO items_images(id,image,image_transform,image_bounds,flags,playback_state,
           playback_frame,playback_speed) VALUES(?,?,CAST(? AS TEXT),CAST(? AS TEXT),1,?,0,1)`,
         [placement.id, imageId, storedTransform(image.image), storedClip(image.clip),
@@ -185,10 +258,20 @@ export async function writePurCopy(original: Uint8Array, placements: Placement[]
         db.run("UPDATE items SET z=? WHERE id=?", [placement.z, placement.id]);
         check(db.getRowsModified() === 1, "画像の重なり順を更新できませんでした");
       }
-      if (before.item.every((value, i) => value === placement.item[i])) continue;
+      const content = placement.content ?? before;
+      if (parentId(content) === parentId(before) &&
+          samePlacement(localPlacement(before.item, before), localPlacement(placement.item, content), false)) continue;
       // Bind UTF-8 bytes and cast to TEXT: direct sql.js string binding truncates embedded NULs.
-      db.run("UPDATE items SET transform=CAST(? AS TEXT) WHERE id=?", [storedTransform(placement.item), placement.id]);
+      db.run("UPDATE items SET parent=?,transform=CAST(? AS TEXT) WHERE id=?",
+        [parentId(content), storedTransform(localPlacement(placement.item, content)), placement.id]);
       check(db.getRowsModified() === 1, "画像配置を更新できませんでした");
+    }
+    for (const id of deletedIds.filter(id => supported.get(id)?.group)
+      .sort((a, b) => (supported.get(b)?.parent?.ancestors.length ?? 0) - (supported.get(a)?.parent?.ancestors.length ?? 0))) {
+      check(!db.exec(`SELECT id FROM items WHERE parent=${id} OR comment=${id}`).length,
+        "未対応の子要素または参照があるグループは削除できません");
+      db.run("DELETE FROM items_groups WHERE id=?", [id]);
+      db.run("DELETE FROM items WHERE id=?", [id]);
     }
     db.run("COMMIT");
     check(db.exec("PRAGMA integrity_check")[0]?.values[0]?.[0] === "ok", "保存DBの整合性検証に失敗しました");
@@ -196,9 +279,14 @@ export async function writePurCopy(original: Uint8Array, placements: Placement[]
     const output = wrapDatabase(original, db.export());
     const restored = await parsePur(output);
     for (const placement of placements) {
-      const image = restored.images.find(image => image.id === placement.id);
-      check(image && placement.item.every((value, i) => value === image.item[i]), "保存後の画像配置が一致しません");
+      const image = [...restored.images, ...restored.groups ?? []].find(image => image.id === placement.id);
+      check(image && samePlacement(placement.item, image.item, Boolean(image.parent)), "保存後の画像配置が一致しません");
       check(placement.z === undefined || image.z === placement.z, "保存後の重なり順が一致しません");
+      if (placement.content) check(parentId(image) === parentId(placement.content), "保存後の親グループが一致しません");
+      if (image.group) {
+        check(image.group.color === placement.content?.group?.color, "保存後のグループ背景色が一致しません");
+        continue;
+      }
       if (!supported.has(placement.id)) {
         const content = placement.content!;
         check(image.width === content.width && image.height === content.height && image.mime === content.mime &&
@@ -213,7 +301,8 @@ export async function writePurCopy(original: Uint8Array, placements: Placement[]
         "保存後の追加画像が一致しません");
       }
     }
-    check(deletedIds.every(id => !restored.images.some(image => image.id === id)), "保存後に削除画像が残っています");
+    const restoredIds = new Set([...restored.images, ...restored.groups ?? []].map(image => image.id));
+    check(deletedIds.every(id => !restoredIds.has(id)), "保存後に削除項目が残っています");
     return output;
   } finally { db.close(); }
 }

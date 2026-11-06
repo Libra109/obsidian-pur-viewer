@@ -1,7 +1,7 @@
 import initSqlJs from "sql.js/dist/sql-asm.js";
 import type { Database, SqlJsStatic, SqlValue } from "sql.js";
 import { check, Reader, verifyChecksum } from "./binary";
-import { Board, BoardImage, imageMime, StoredRow } from "./board";
+import { Board, BoardImage, compareImageStack, IDENTITY, imageMime, invert, Matrix, multiply, StoredRow, updateHierarchy } from "./board";
 import { compareOrder, decodeClip, decodeOrder, decodeTransform, Rational } from "./codecs";
 
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -114,6 +114,70 @@ export function boardFromDatabase(db: Database): Board {
   const sourceRows = storedRows(db, "images", "LIMIT 10001");
   check(sourceRows.size <= 10000, "画像数が10000件の上限を超えています");
   const images = new Map([...sourceRows].map(([id, row]) => [id, row.values]));
+  const hierarchyRows = rows(db, `SELECT id,parent,z,opacity,locked,
+    CAST(transform AS BLOB) AS transform,typeof(transform) AS transform_type,
+    CAST(sort_order AS BLOB) AS sort_order,typeof(sort_order) AS sort_order_type FROM items LIMIT 20001`);
+  check(hierarchyRows.length <= 20000, "階層項目数が20000件の上限を超えています");
+  const hierarchy = new Map(hierarchyRows.map(row => [integer(row.id, "items.id"), row]));
+  const groups = new Map(rows(db, "SELECT id,lock_mode,background_color FROM items_groups")
+    .map(row => [integer(row.id, "items_groups.id"), row]));
+  const rank = new Map<number, number>();
+  const children = new Map<number, Row[]>();
+  for (const row of hierarchyRows) {
+    const parent = integer(row.parent ?? -1, "parent");
+    const siblings = children.get(parent) ?? [];
+    siblings.push(row);
+    children.set(parent, siblings);
+  }
+  for (const siblings of children.values()) {
+    const ordered = siblings.map(row => ({ row, z: number(row.z, "items.z", 0),
+      order: decodeOrder(storedVariant(row, "sort_order")) }));
+    ordered.sort((a, b) => a.z - b.z || compareOrder(a.order, b.order) ||
+      integer(a.row.id, "items.id") - integer(b.row.id, "items.id"));
+    ordered.forEach(({ row }, index) => rank.set(integer(row.id, "items.id"), index));
+  }
+  const parents = new Map<number, BoardImage["parent"] | null>();
+  const parentOf = (row: Row): BoardImage["parent"] | null => {
+    const parentId = integer(row.parent ?? -1, "parent");
+    if (parentId === -1) return undefined;
+    if (parents.has(parentId)) return parents.get(parentId);
+    const chain: Row[] = [];
+    const seen = new Set<number>([integer(row.id, "items.id")]);
+    let id = parentId;
+    while (id !== -1) {
+      check(!seen.has(id), "グループ階層が循環しています");
+      check(chain.length < 64, "グループ階層が64段の上限を超えています");
+      seen.add(id);
+      const ancestor = hierarchy.get(id), group = groups.get(id);
+      if (!ancestor || !group) {
+        warnings.add("親グループを確認できないグループ内画像は表示していません");
+        parents.set(parentId, null);
+        return null;
+      }
+      if (number(ancestor.opacity, "グループの不透明度", 1) !== 1 ||
+          number(ancestor.locked, "グループのロック", 0) !== 0 ||
+          number(group.lock_mode, "グループのロックモード", 1) !== 1) {
+        warnings.add("未検証の不透明度またはロック設定を持つグループ内画像は表示していません");
+        parents.set(parentId, null);
+        return null;
+      }
+      chain.unshift(ancestor);
+      id = integer(ancestor.parent ?? -1, "parent");
+    }
+    let transform: Matrix = [...IDENTITY];
+    for (const ancestor of chain) transform = multiply(transform, decodeTransform(storedVariant(ancestor, "transform")));
+    check(invert(transform), "親グループの変換を逆変換できません");
+    const siblings = children.get(parentId)!;
+    const parent: BoardImage["parent"] = { id: parentId, transform,
+      ancestors: chain.map(ancestor => ({ id: integer(ancestor.id, "items.id"),
+        z: number(ancestor.z, "items.z", 0), order: rank.get(integer(ancestor.id, "items.id"))! })),
+      hiddenMaxZ: -Infinity,
+      frontmostId: integer(siblings.reduce((top, sibling) =>
+        rank.get(integer(sibling.id, "items.id"))! > rank.get(integer(top.id, "items.id"))! ? sibling : top).id,
+      "items.id") };
+    parents.set(parentId, parent);
+    return parent;
+  };
   const items = rows(db, `SELECT i.id,i.parent,i.opacity,i.z,
     CAST(i.transform AS BLOB) AS transform,typeof(i.transform) AS transform_type,
     CAST(i.sort_order AS BLOB) AS sort_order,typeof(i.sort_order) AS sort_order_type,
@@ -123,11 +187,33 @@ export function boardFromDatabase(db: Database): Board {
     FROM items i JOIN items_images ii ON i.id=ii.id ORDER BY i.id LIMIT 10001`);
   check(items.length <= 10000, "画像項目数が10000件の上限を超えています");
   const ordered: { image: BoardImage; order: Rational }[] = [];
+  const groupItems: BoardImage[] = [];
+  const groupRows = storedRows(db, "items_groups"), baseRows = storedRows(db, "items");
+  for (const [id, group] of groups) {
+    const row = hierarchy.get(id);
+    if (!row) { warnings.add("基底項目のないグループは表示していません"); continue; }
+    const parent = parentOf(row);
+    if (parent === null) continue;
+    const unsupported = number(row.opacity, "グループの不透明度", 1) !== 1 ||
+      number(row.locked, "グループのロック", 0) !== 0 ||
+      number(group.lock_mode, "グループのロックモード", 1) !== 1;
+    if (unsupported) { warnings.add("未検証の不透明度またはロック設定を持つグループは表示していません"); continue; }
+    const color = group.background_color;
+    check(color === null || typeof color === "string" && /^#[\da-f]{8}$/i.test(color),
+      "未対応のグループ背景色です");
+    groupItems.push({ id, data: new Uint8Array(), mime: "application/x-pur-group",
+      width: 20, height: 20, image: [...IDENTITY], opacity: 1, z: number(row.z, "z", 0),
+      stackOrder: rank.get(id), ...(parent ? { parent } : {}),
+      localItem: decodeTransform(storedVariant(row, "transform")),
+      item: parent ? multiply(parent.transform, decodeTransform(storedVariant(row, "transform")))
+        : decodeTransform(storedVariant(row, "transform")),
+      group: { color, stored: groupRows.get(id) },
+      stored: { item: baseRows.get(id)!, imageItem: groupRows.get(id)!, source: groupRows.get(id)! } });
+  }
   for (const row of items) {
     const id = integer(row.id, "items.id");
-    if (number(row.parent, "parent", -1) !== -1) {
-      warnings.add("グループ内の画像は未対応のため表示していません"); continue;
-    }
+    const parent = parentOf(row);
+    if (parent === null) continue;
     const source = row.image === null ? undefined : images.get(integer(row.image, "image"));
     if (!source || source.source_type !== 1 || !(source.data instanceof Uint8Array)) {
       warnings.add("外部リンク画像または画像データのない項目は表示していません"); continue;
@@ -153,8 +239,12 @@ export function boardFromDatabase(db: Database): Board {
     ordered.push({
       order: decodeOrder(storedVariant(row, "sort_order")),
       image: {
-        id, data: source.data, mime, width, height, opacity,
-        z: number(row.z, "z", 0), item: decodeTransform(storedVariant(row, "transform")),
+        id, data: source.data, mime, width, height, opacity, stackOrder: rank.get(id)!,
+        z: number(row.z, "z", 0), item: parent
+          ? multiply(parent.transform, decodeTransform(storedVariant(row, "transform")))
+          : decodeTransform(storedVariant(row, "transform")),
+        localItem: decodeTransform(storedVariant(row, "transform")),
+        ...(parent ? { parent } : {}),
         image: decodeTransform(storedVariant(row, "image_transform")),
         clip: decodeClip(storedVariant(row, "image_bounds")),
       },
@@ -162,7 +252,7 @@ export function boardFromDatabase(db: Database): Board {
     if (mime === "image/gif" || mime === "image/webp")
       warnings.add("GIFとWebPは先頭フレームを静止表示し、元の画像データを保持します");
   }
-  ordered.sort((a, b) => a.image.z - b.image.z || compareOrder(a.order, b.order) || a.image.id - b.image.id);
+  ordered.sort((a, b) => compareImageStack(a.image, b.image, rank.get(a.image.id)!, rank.get(b.image.id)!));
   board.images = ordered.map(value => value.image);
   if (board.images.length) {
     const where = `WHERE id IN (${board.images.map(image => image.id).join(",")})`;
@@ -175,10 +265,53 @@ export function boardFromDatabase(db: Database): Board {
     }
   }
   const displayedIds = new Set(board.images.map(image => image.id));
+  for (const parent of parents.values()) {
+    if (!parent) continue;
+    parent.hiddenMaxZ = (children.get(parent.id) ?? [])
+      .filter(row => !displayedIds.has(integer(row.id, "items.id")))
+      .reduce((max, row) => Math.max(max, number(row.z, "items.z", 0)), -Infinity);
+  }
   board.maxHiddenRootZ = rootZ.filter(row => !displayedIds.has(integer(row.id, "items.id")))
     .reduce((max, row) => Math.max(max, number(row.z, "items.z", 0)), -Infinity);
+  const supportedIds = new Set([...board.images, ...groupItems].map(item => item.id));
+  board.maxHiddenRootZ = rootZ.filter(row => !supportedIds.has(integer(row.id, "items.id")))
+    .reduce((max, row) => Math.max(max, number(row.z, "items.z", 0)), -Infinity);
+  for (const parent of parents.values()) if (parent) parent.hiddenMaxZ = (children.get(parent.id) ?? [])
+    .filter(row => !supportedIds.has(integer(row.id, "items.id")))
+    .reduce((max, row) => Math.max(max, number(row.z, "items.z", 0)), -Infinity);
+  const unsafeGroups = new Set<number>();
+  const markAncestors = (id: number) => {
+    const seen = new Set<number>();
+    while (id !== -1 && !seen.has(id)) {
+      seen.add(id);
+      unsafeGroups.add(id);
+      id = integer(hierarchy.get(id)?.parent ?? -1, "parent");
+    }
+  };
+  for (const row of hierarchyRows) if (!supportedIds.has(integer(row.id, "id")))
+    markAncestors(integer(row.parent ?? -1, "parent"));
+  for (const row of rows(db, "SELECT comment FROM items WHERE comment IS NOT NULL"))
+    if (typeof row.comment === "number") markAncestors(integer(row.comment, "comment"));
+  for (const group of groupItems) {
+    if (unsafeGroups.has(group.id))
+      group.group!.unsupported = "未対応の子要素または参照があるグループは編集できません";
+    if (group.group!.unsupported) warnings.add(group.group!.unsupported);
+  }
+  updateHierarchy([...board.images, ...groupItems]);
+  for (const item of [...board.images, ...groupItems]) item.localItemWorld = [...item.item];
+  board.groups = groupItems;
+  const knownTables = new Set(["images", "items", "items_images", "items_groups", "items_notes", "items_drawings", "metadata"]);
+  const preservedItems = new Set(rows(db, "SELECT id FROM items_notes UNION SELECT id FROM items_drawings")
+    .map(row => integer(row.id, "未表示項目ID")));
+  board.hiddenItems = hierarchyRows.filter(row => !supportedIds.has(integer(row.id, "id")))
+    .map(row => ({ id: integer(row.id, "id"), parent: integer(row.parent ?? -1, "parent"),
+      z: number(row.z, "items.z", 0) }));
+  if (board.hiddenItems.some(item => !preservedItems.has(item.id)) ||
+      rows(db, "SELECT name FROM sqlite_master WHERE type='table'").some(row => !knownTables.has(String(row.name))) ||
+      rows(db, "SELECT id FROM items WHERE comment IS NOT NULL LIMIT 1").length)
+    board.structureIssue = "未対応の項目、参照、テーブルがあるためグループ作成、解除、一括削除は利用できません";
   for (const [table, label] of [
-    ["items_groups", "グループの背景"], ["items_notes", "ノート"], ["items_drawings", "描画ストローク"],
+    ["items_notes", "ノート"], ["items_drawings", "描画ストローク"],
   ]) {
     if (rows(db, `SELECT id FROM ${table} LIMIT 1`).length)
       warnings.add(`${label}は未対応のため表示していません`);
