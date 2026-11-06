@@ -1,4 +1,4 @@
-import { BoardImage, invert, Matrix, multiply, Point, transform } from "./board";
+import { BoardImage, invert, Matrix, multiply, Point, transform, transformedBounds } from "./board";
 import { check } from "./binary";
 
 const POSITIONS: Point[] = [
@@ -6,16 +6,41 @@ const POSITIONS: Point[] = [
   { x: 1, y: 1 }, { x: 0.5, y: 1 }, { x: 0, y: 1 }, { x: 0, y: 0.5 },
 ];
 
-export function imageHandles(image: BoardImage): Point[] {
+export type ImageGeometry = Pick<BoardImage, "width" | "height" | "item" | "image">;
+
+export function selectionFrame(images: BoardImage[]): ImageGeometry | undefined {
+  if (images.length < 2) return images[0];
+  const bounds = transformedBounds(images);
+  return { width: bounds.width, height: bounds.height,
+    item: [1, 0, 0, 1, bounds.x, bounds.y], image: [1, 0, 0, 1, 0, 0] };
+}
+
+export function intersectsSelection(image: ImageGeometry, start: Point, end: Point): boolean {
+  const left = Math.min(start.x, end.x), right = Math.max(start.x, end.x);
+  const top = Math.min(start.y, end.y), bottom = Math.max(start.y, end.y);
+  const rectangle = [{ x: left, y: top }, { x: right, y: top }, { x: right, y: bottom }, { x: left, y: bottom }];
+  const corners = imageHandles(image).filter((_, index) => index % 2 === 0);
+  const axes = [{ x: 1, y: 0 }, { x: 0, y: 1 }, ...corners.map((corner, index) => {
+    const next = corners[(index + 1) % corners.length];
+    return { x: -(next.y - corner.y), y: next.x - corner.x };
+  })];
+  return axes.every(axis => {
+    const a = corners.map(point => point.x * axis.x + point.y * axis.y);
+    const b = rectangle.map(point => point.x * axis.x + point.y * axis.y);
+    return Math.max(...a) >= Math.min(...b) && Math.max(...b) >= Math.min(...a);
+  });
+}
+
+export function imageHandles(image: ImageGeometry): Point[] {
   const matrix = multiply(image.item, image.image);
   return POSITIONS.map(point => transform(matrix, { x: point.x * image.width, y: point.y * image.height }));
 }
 
-export function imageCenter(image: BoardImage): Point {
+export function imageCenter(image: ImageGeometry): Point {
   return transform(multiply(image.item, image.image), { x: image.width / 2, y: image.height / 2 });
 }
 
-export function resizeCursor(image: BoardImage, index: number): string {
+export function resizeCursor(image: ImageGeometry, index: number): string {
   const handles = imageHandles(image);
   const handle = handles[index];
   const anchor = handles[(index + 4) % 8];
@@ -26,7 +51,7 @@ export function resizeCursor(image: BoardImage, index: number): string {
   return ["ew-resize", "nwse-resize", "ns-resize", "nesw-resize"][direction];
 }
 
-export function rotationHandles(image: BoardImage, offset: number): Point[] {
+export function rotationHandles(image: ImageGeometry, offset: number): Point[] {
   const handles = imageHandles(image);
   const center = imageCenter(image);
   return [0, 2, 4, 6].map(index => {

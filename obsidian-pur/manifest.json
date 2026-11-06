@@ -1,7 +1,7 @@
 {
   "id": "lazyref-pur",
   "name": "LazyRef PUR Viewer",
-  "version": "0.13.0",
+  "version": "0.15.0",
   "minAppVersion": "1.8.0",
   "description": "Edit PureRef image boards with a canvas grid and guarded saving on desktop and mobile.",
   "author": "LazyRef contributors",

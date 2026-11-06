@@ -7,7 +7,7 @@ import { BoardEditor } from "../src/editor";
 import { wrapDatabase, writePurCopy } from "../src/writer";
 import { drawGrid, gridLines } from "../src/grid";
 import {
-  flipItem, imageCenter, imageHandles, rotateMatrixAboutPoint, rotationHandles,
+  flipItem, imageCenter, imageHandles, resizeCursor, resizeFromHandle, rotateMatrixAboutPoint, rotationHandles,
 } from "../src/handles";
 import { BackupRecord, BackupStore, PurBackups } from "../src/backups";
 import { overwriteVerified } from "../src/overwrite";
@@ -497,12 +497,13 @@ async function run(): Promise<void> {
     message => interactionDiagnostics.push(message));
     const capture = canvas.setPointerCapture;
     canvas.setPointerCapture = () => {};
-    const send = (type: string, id: number, x: number, y: number, button = 0, pointerType = "touch") => {
+    const send = (type: string, id: number, x: number, y: number, button = 0, pointerType = "touch",
+      modifiers: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean } = {}) => {
       const rect = canvas.getBoundingClientRect();
       const p = { x: rect.left + x * renderer.camera.scale + renderer.camera.x,
         y: rect.top + y * renderer.camera.scale + renderer.camera.y };
       canvas.dispatchEvent(new PointerEvent(type, { pointerId: id, pointerType,
-        clientX: p.x, clientY: p.y, button, cancelable: true }));
+        clientX: p.x, clientY: p.y, button, cancelable: true, ...modifiers }));
     };
     const pixelAtLocal = (x: number, y: number) => {
       const world = transform(multiply(first.item, first.image), { x, y });
@@ -567,6 +568,110 @@ async function run(): Promise<void> {
         "最初のUndoは移動だけを取り消し前面化を維持");
       renderer.undo();
       assert(!editor.dirty && !editor.canUndo, "次のUndoで前面化を一度だけ取り消す");
+      editor.select();
+      const modifiedTap = (x: number, modifiers: { ctrlKey?: boolean; metaKey?: boolean }) => {
+        send("pointerdown", 1, x, 24, 0, "mouse", modifiers);
+        send("pointerup", 1, x, 24, 0, "mouse", modifiers);
+      };
+      modifiedTap(16, { ctrlKey: true });
+      modifiedTap(80, { metaKey: true });
+      await nextFrame();
+      assert(editor.selectedImages.length === 2 && !editor.dirty && !editor.canUndo,
+        "Ctrl/Cmdクリックは前面化せず複数選択を描画");
+      send("pointermove", 91, 0, 0, 0, "mouse");
+      assert(canvas.style.cursor === "nwse-resize" && !renderer.canTransformSelected && renderer.canAlignSelected,
+        "複数選択は共通拡縮ハンドルと整列を有効化");
+      const groupedBefore = editor.snapshot();
+      send("pointerdown", 1, 16, 24);
+      send("pointermove", 1, 19, 29);
+      send("pointerup", 1, 19, 29);
+      assert(editor.selectedImages.length === 2 &&
+        Math.abs(first.item[4] - 3) < 1e-8 && Math.abs(second.item[4] - 35) < 1e-8 &&
+        Math.abs(first.item[5] - second.item[5]) < 1e-8,
+      "選択済み画像のドラッグは集合と相対配置を維持");
+      renderer.undo();
+      assert(JSON.stringify(editor.snapshot()) === JSON.stringify(groupedBefore) && !editor.canUndo,
+        "複数画像の移動は1回のUndoで全体を復元");
+      renderer.redo();
+      assert(Math.abs(first.item[4] - 3) < 1e-8, "複数移動を一括Redo");
+      renderer.undo();
+      send("pointerdown", 1, 16, 24);
+      send("pointerdown", 2, 80, 24);
+      send("pointermove", 2, 85, 29);
+      send("pointerup", 2, 85, 29);
+      send("pointerup", 1, 16, 24);
+      assert(editor.selectedImages.length === 2 &&
+        JSON.stringify(editor.snapshot()) === JSON.stringify(groupedBefore),
+      "2本指カメラ移動は選択集合と画像配置を維持");
+      renderer.alignSelected("right");
+      assert(first.item[4] === second.item[4] && editor.dirty,
+        "実Canvasの整列操作は画像を平行移動");
+      renderer.undo();
+      assert(JSON.stringify(editor.snapshot()) === JSON.stringify(groupedBefore),
+        "整列を一括Undo");
+      send("pointerdown", 1, -10, -10, 0, "mouse", { shiftKey: true });
+      send("pointermove", 1, 1, 1, 0, "mouse", { shiftKey: true });
+      send("pointerup", 1, 1, 1, 0, "mouse", { shiftKey: true });
+      assert(editor.selectedId === first.id && !editor.dirty, "Shift空白ドラッグは部分交差画像で選択を置換");
+      send("pointerdown", 1, 110, 60, 0, "mouse", { shiftKey: true });
+      send("pointermove", 1, -10, -10, 0, "mouse", { shiftKey: true });
+      send("pointerup", 1, -10, -10, 0, "mouse", { shiftKey: true });
+      assert(editor.selectedImages.length === 2, "逆方向の範囲選択も集合を選択");
+      const common = { width: 96, height: 48, item: [1, 0, 0, 1, 0, 0] as typeof first.item,
+        image: [1, 0, 0, 1, 0, 0] as typeof first.item };
+      for (let index = 0; index < 8; index++) {
+        const handles = imageHandles(common), start = handles[index], anchor = handles[(index + 4) % 8];
+        const end = { x: start.x + (start.x - anchor.x) / 2, y: start.y + (start.y - anchor.y) / 2 };
+        send("pointerdown", 1, start.x, start.y, 0, "mouse");
+        send("pointermove", 1, end.x, end.y, 0, "mouse");
+        const pixel = pixelAtLocal(16, 24);
+        assert(pixel[0] === 255 && pixel[3] === 255, `集合拡縮ハンドル${index + 1}は移動中に画像を再描画`);
+        send("pointerup", 1, end.x, end.y, 0, "mouse");
+        const actualAnchor = imageHandles({ ...common,
+          item: resizeFromHandle(common.item, anchor,
+            { x: start.x - anchor.x, y: start.y - anchor.y }, start, end) })[(index + 4) % 8];
+        assert(Math.hypot(actualAnchor.x - anchor.x, actualAnchor.y - anchor.y) < 1e-8 &&
+          Math.abs(first.item[0] - 1.5) < 1e-8 && Math.abs(second.item[0] - 1.5) < 1e-8,
+        `共通ハンドル${index + 1}の等比拡縮は対向点を固定`);
+        renderer.undo();
+        assert(JSON.stringify(editor.snapshot()) === JSON.stringify(groupedBefore) && !editor.canUndo,
+          `集合拡縮ハンドル${index + 1}を1回でUndo`);
+      }
+      const groupCenter = imageCenter(common), groupStart = rotationHandles(common, 20 / renderer.camera.scale)[0];
+      const angle = Math.PI / 4;
+      const groupEnd = { x: groupCenter.x + Math.cos(angle) * (groupStart.x - groupCenter.x) -
+        Math.sin(angle) * (groupStart.y - groupCenter.y),
+      y: groupCenter.y + Math.sin(angle) * (groupStart.x - groupCenter.x) +
+        Math.cos(angle) * (groupStart.y - groupCenter.y) };
+      send("pointerdown", 1, groupStart.x, groupStart.y, 0, "mouse");
+      send("pointermove", 1, groupEnd.x, groupEnd.y, 0, "mouse");
+      const groupPixel = pixelAtLocal(16, 24);
+      assert(groupPixel[0] === 255 && groupPixel[3] === 255, "集合回転中も実画素を即時描画");
+      send("pointerup", 1, groupEnd.x, groupEnd.y, 0, "mouse");
+      const rotatedCommon = { ...common, item: rotateMatrixAboutPoint(common.item, groupCenter, angle) };
+      const rotatedHandle = imageHandles(rotatedCommon)[1];
+      send("pointermove", 91, rotatedHandle.x, rotatedHandle.y, 0, "mouse");
+      assert(canvas.style.cursor === resizeCursor(rotatedCommon, 1), "集合回転後のカーソルは回転した共通枠に一致");
+      const rotatedState = editor.snapshot();
+      const rotatedAnchor = imageHandles(rotatedCommon)[5];
+      const rotatedEnd = { x: rotatedHandle.x + (rotatedHandle.x - rotatedAnchor.x) / 2,
+        y: rotatedHandle.y + (rotatedHandle.y - rotatedAnchor.y) / 2 };
+      send("pointerdown", 1, rotatedHandle.x, rotatedHandle.y, 0, "mouse");
+      send("pointermove", 1, rotatedEnd.x, rotatedEnd.y, 0, "mouse");
+      send("pointerup", 1, rotatedEnd.x, rotatedEnd.y, 0, "mouse");
+      assert(Math.abs(first.item[0] - Math.cos(angle) * 1.5) < 1e-8,
+        "回転した共通ハンドルのヒット領域で集合を追加拡縮");
+      renderer.undo();
+      assert(JSON.stringify(editor.snapshot()) === JSON.stringify(rotatedState), "追加拡縮Undoは集合回転を維持");
+      renderer.undo();
+      assert(JSON.stringify(editor.snapshot()) === JSON.stringify(groupedBefore) && !editor.canUndo,
+        "集合回転も1回のUndoで元の全配置へ復元");
+      modifiedTap(16, { ctrlKey: true });
+      assert(editor.selectedId === second.id && !renderer.canAlignSelected,
+        "再Ctrlクリックはその画像だけ解除し1枚選択へ戻る");
+      tap(-10, -10);
+      assert(editor.selectedImages.length === 0, "空白クリックは選択集合を解除");
+      renderer.fit();
       editor.select(first.id);
       const resizeHover = imageHandles(first)[0];
       send("pointermove", 91, resizeHover.x, resizeHover.y, 0, "mouse");

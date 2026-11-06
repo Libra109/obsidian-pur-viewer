@@ -60,6 +60,11 @@ export function invert(m: Matrix): Matrix | undefined {
 }
 
 export function boardBounds(images: BoardImage[]): Bounds {
+  const bounds = transformedBounds(images);
+  return { ...bounds, width: Math.max(bounds.width, 1), height: Math.max(bounds.height, 1) };
+}
+
+export function transformedBounds(images: BoardImage[]): Bounds {
   if (!images.length) return { x: 0, y: 0, width: 1, height: 1 };
   let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
   for (const image of images) {
@@ -72,7 +77,7 @@ export function boardBounds(images: BoardImage[]): Bounds {
       top = Math.min(top, q.y); bottom = Math.max(bottom, q.y);
     }
   }
-  const width = Math.max(right - left, 1), height = Math.max(bottom - top, 1);
+  const width = right - left, height = bottom - top;
   check(Number.isFinite(width) && Number.isFinite(height), "ボードの範囲が大きすぎます");
   return { x: left, y: top, width, height };
 }

@@ -8,6 +8,8 @@ import { imageDimensions } from "../src/image-import";
 import type { ImageEditState } from "../src/editor";
 import { animatedWebp, bmpFixture, gifFixture } from "./raster-fixtures";
 import { svgFixture } from "./svg-fixtures";
+import { transformedBounds } from "../src/board";
+import { imageCenter, imageHandles, rotationHandles, selectionFrame } from "../src/handles";
 
 test("browser bundle parses actual v2 and rejects legacy without Node, WASM assets or network", async () => {
   // Use the exact same build settings as the shipped plugin.
@@ -138,7 +140,10 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     onClose(): Promise<void>;
     savePurCurrent(): Promise<void>;
     importQueue: Promise<void>;
-    renderer: { insertionPoint(point?: { x: number; y: number }): { x: number; y: number } };
+    renderer: {
+      insertionPoint(point?: { x: number; y: number }): { x: number; y: number };
+      camera: { x: number; y: number; scale: number };
+    };
     onPaneMenu(menu: MenuStub, source: string): void;
     editor: {
       snapshot(): ImageEditState[];
@@ -149,6 +154,8 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
       redo(): void;
       discard(): void;
       select(id?: number): void;
+      toggleSelection(id: number): void;
+      selectedImages: { id: number }[];
       selectedId?: number;
       dirty: boolean;
       canUndo: boolean;
@@ -210,6 +217,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
       canvasHandlers.set(this, handlers);
     }
     focus() {}
+    setPointerCapture() {}
     getBoundingClientRect() { return { left: 0, top: 0 }; }
     private child() {
       const element = new ElementStub();
@@ -536,7 +544,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.ok(diagnosticsCommand);
   diagnosticsCommand.callback!();
   const diagnosticNotice = diagnosticOutputs[diagnosticOutputs.length - 1]?.value ?? "";
-  assert.ok(diagnosticNotice.includes("ビルド: 0.13.0"));
+  assert.ok(diagnosticNotice.includes("ビルド: 0.15.0"));
   assert.ok(diagnosticNotice.includes("ファイル読込 failed"));
   const first = new FakeTFile("boards/first.pur");
   const second = new FakeTFile("boards/second.pur");
@@ -1016,7 +1024,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal(imageView.editor.snapshot().length, 4);
   const imageKeys = canvasHandlers.get(imageCanvas)!.get("keydown")!;
   let deletePrevented = false;
-  imageKeys({ key: "Delete", preventDefault: () => { deletePrevented = true; } });
+  imageKeys({ target: imageCanvas, key: "Delete", preventDefault: () => { deletePrevented = true; } });
   assert.equal(deletePrevented, true);
   assert.equal(imageView.editor.snapshot().length, 3);
   imageView.editor.undo();
@@ -1024,14 +1032,14 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   titledActions.get("選択した画像を削除")!();
   assert.equal(imageView.editor.snapshot().length, 3);
   imageView.editor.undo();
-  imageKeys({ key: "Backspace", preventDefault() {} });
+  imageKeys({ target: imageCanvas, key: "Backspace", preventDefault() {} });
   assert.equal(imageView.editor.snapshot().length, 3);
   imageView.editor.undo();
-  imageKeys({ key: "v", ctrlKey: true, preventDefault: () => assert.fail("native Ctrl+V was blocked") });
+  imageKeys({ target: imageCanvas, key: "v", ctrlKey: true, preventDefault: () => assert.fail("native Ctrl+V was blocked") });
   imageView.onPaneMenu(new MenuStub(), "more-options");
   titledActions.get("閲覧モードへ")!();
   paste({ target: imageCanvas, clipboardData, preventDefault: () => assert.fail("read-only paste was intercepted") });
-  imageKeys({ key: "Delete", preventDefault: () => assert.fail("read-only Delete was intercepted") });
+  imageKeys({ target: imageCanvas, key: "Delete", preventDefault: () => assert.fail("read-only Delete was intercepted") });
   assert.equal(imageView.editor.snapshot().length, 4);
   imageView.onPaneMenu(new MenuStub(), "more-options");
   titledActions.get("編集モードへ")!();
@@ -1044,7 +1052,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal(imageView.editor.dirty, false, "image addition participates in idle autosave");
   assert.equal((await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!))).images.length, 4);
   imageView.editor.select(pasted.id);
-  imageKeys({ key: "Delete", preventDefault() {} });
+  imageKeys({ target: imageCanvas, key: "Delete", preventDefault() {} });
   await imageView.savePurCurrent();
   assert.equal(imageView.editor.dirty, false);
   const deletedOutput = new Uint8Array(liveFiles.get("boards/images.pur")!);
@@ -1054,7 +1062,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal((await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!))).images.length, 4,
     "Undo after saving a deletion recreates its image rows");
   imageView.editor.select(dropped.id);
-  imageKeys({ key: "Delete", preventDefault() {} });
+  imageKeys({ target: imageCanvas, key: "Delete", preventDefault() {} });
   backupHook = async () => { imageView.editor.undo(); };
   await imageView.savePurCurrent();
   backupHook = undefined;
@@ -1069,6 +1077,158 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal(imageBackups.length, 1, "image edits retain exactly one managed backup generation");
   assert.deepEqual(new Uint8Array(savedFiles.get(imageBackups[0].path)!), concurrentDeletion,
     "the remaining recovery copy contains the immediately preceding deletion");
+  const alignments = [
+    ["左端揃え", (b: ReturnType<typeof transformedBounds>) => b.x],
+    ["右端揃え", (b: ReturnType<typeof transformedBounds>) => b.x + b.width],
+    ["上端揃え", (b: ReturnType<typeof transformedBounds>) => b.y],
+    ["下端揃え", (b: ReturnType<typeof transformedBounds>) => b.y + b.height],
+    ["水平中央揃え", (b: ReturnType<typeof transformedBounds>) => b.x + b.width / 2],
+    ["垂直中央揃え", (b: ReturnType<typeof transformedBounds>) => b.y + b.height / 2],
+  ] as const;
+  for (const id of [undefined, pasted.id]) {
+    imageView.editor.select(id);
+    imageView.onPaneMenu(new MenuStub(), "more-options");
+    for (const [title] of alignments) assert.equal(menuDisabled.get(title), true);
+  }
+  imageView.editor.setItem(pasted.id, [0, 3, -2, 0, 100, -200]);
+  imageView.editor.commit(pasted.id, pasted.item);
+  imageView.editor.setItem(dropped.id, [0.5, 0.3, 0.2, 1, -100, 80]);
+  imageView.editor.commit(dropped.id, dropped.item);
+  imageView.editor.select(pasted.id);
+  imageView.editor.toggleSelection(dropped.id);
+  const groupBefore = imageView.editor.snapshot();
+  const selectedBounds = transformedBounds(groupBefore.filter(entry =>
+    entry.id === pasted.id || entry.id === dropped.id).map(entry => entry.content));
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  assert.equal(menuDisabled.get("90°時計回りに回転"), false, "group rotation is available");
+  assert.equal(menuDisabled.get("左右反転"), true, "group reflection is not part of this release");
+  assert.equal(menuDisabled.get("選択した画像を削除"), false);
+  for (const [title, coordinate] of alignments) {
+    imageView.onPaneMenu(new MenuStub(), "more-options");
+    assert.equal(menuDisabled.get(title), false);
+    titledActions.get(title)!();
+    const aligned = imageView.editor.snapshot();
+    for (const entry of aligned) {
+      if (entry.id === pasted.id || entry.id === dropped.id) {
+        assert.ok(Math.abs(coordinate(transformedBounds([entry.content])) - coordinate(selectedBounds)) < 1e-8,
+          `${title} uses the current transformed image bounds`);
+      } else assert.deepEqual(entry, groupBefore.find(before => before.id === entry.id));
+    }
+    await imageView.savePurCurrent();
+    const reopened = await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!));
+    for (const expected of aligned) {
+      const actual = reopened.images.find(image => image.id === expected.id)!;
+      assert.deepEqual(actual.item, Array.from(expected.item), `${title} survives save and reparse`);
+      assert.deepEqual(actual.data, Uint8Array.from(expected.content.data));
+    }
+    imageView.editor.undo();
+    assert.deepEqual(imageView.editor.snapshot(), groupBefore, `${title} undoes the entire group`);
+    imageView.editor.redo();
+    assert.deepEqual(imageView.editor.snapshot(), aligned, `${title} redoes the entire group`);
+    imageView.editor.undo();
+    assert.equal(imageView.editor.selectedImages.length, 2);
+  }
+  imageKeys({ target: imageCanvas, key: "Delete", preventDefault() {} });
+  assert.equal(imageView.editor.snapshot().length, groupBefore.length - 2, "Delete removes the entire selection");
+  imageKeys({ target: imageCanvas, key: "z", ctrlKey: true, preventDefault() {} });
+  assert.deepEqual(imageView.editor.snapshot(), groupBefore, "Ctrl+Z restores all selected images in one step");
+  assert.equal(imageView.editor.selectedImages.length, 2);
+  imageKeys({ target: imageCanvas, key: "z", metaKey: true, shiftKey: true, preventDefault() {} });
+  assert.equal(imageView.editor.snapshot().length, groupBefore.length - 2, "Cmd+Shift+Z redoes the whole deletion");
+  imageKeys({ target: imageCanvas, key: "z", metaKey: true, preventDefault() {} });
+  const keysBefore = imageView.editor.snapshot();
+  for (const target of [plainInput, new ElementStub()]) {
+    for (const key of ["Delete", "Backspace", "Escape", "z"]) {
+      imageKeys({ target, key, ctrlKey: key === "z", preventDefault: () => assert.fail("foreign key intercepted") });
+    }
+  }
+  assert.deepEqual(imageView.editor.snapshot(), keysBefore);
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("閲覧モードへ")!();
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  for (const [title] of alignments) assert.equal(menuDisabled.get(title), true);
+  titledActions.get("編集モードへ")!();
+  await imageView.savePurCurrent();
+  const preAlignmentFile = new Uint8Array(liveFiles.get("boards/images.pur")!).slice();
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("右端揃え")!();
+  const groupAfter = imageView.editor.snapshot();
+  assert.equal(imageView.editor.dirty, true);
+  await new Promise(resolve => setTimeout(resolve, 3200));
+  assert.equal(imageView.editor.dirty, false, "alignment participates in idle autosave");
+  const alignedBoard = await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!));
+  for (const expected of groupAfter) {
+    const actual = alignedBoard.images.find(image => image.id === expected.id)!;
+    assert.deepEqual(actual.item, Array.from(expected.item));
+    assert.deepEqual(actual.data, Uint8Array.from(expected.content.data), "alignment never rewrites image bytes");
+  }
+  const alignmentBackups = (savedSettings?.backups as Array<{ source: string; path: string }>)
+    .filter(record => record.source === "boards/images.pur");
+  assert.equal(alignmentBackups.length, 1);
+  assert.deepEqual(new Uint8Array(savedFiles.get(alignmentBackups[0].path)!), preAlignmentFile);
+  imageView.editor.undo();
+  assert.deepEqual(imageView.editor.snapshot(), groupBefore);
+  await imageView.savePurCurrent();
+  const undoneBoard = await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!));
+  for (const expected of groupBefore)
+    assert.deepEqual(undoneBoard.images.find(image => image.id === expected.id)!.item, Array.from(expected.item));
+  const groupEntries = () => imageView.editor.snapshot().filter(entry =>
+    entry.id === pasted.id || entry.id === dropped.id).map(entry => entry.content);
+  const sendGroupPointer = (type: string, point: { x: number; y: number }, shiftKey = false) => {
+    const camera = imageView.renderer.camera;
+    canvasHandlers.get(imageCanvas)!.get(type)!({ type, target: imageCanvas, pointerId: 1,
+      pointerType: "mouse", button: 0, shiftKey,
+      clientX: point.x * camera.scale + camera.x, clientY: point.y * camera.scale + camera.y,
+      preventDefault() {} });
+  };
+  const selectionBounds = transformedBounds(groupEntries());
+  sendGroupPointer("pointerdown", { x: selectionBounds.x - 100, y: selectionBounds.y - 100 }, true);
+  sendGroupPointer("pointermove", {
+    x: selectionBounds.x + selectionBounds.width + 100, y: selectionBounds.y + selectionBounds.height + 100,
+  }, true);
+  sendGroupPointer("pointerup", {
+    x: selectionBounds.x + selectionBounds.width + 100, y: selectionBounds.y + selectionBounds.height + 100,
+  }, true);
+  assert.ok(imageView.editor.selectedImages.length >= 2, "Shift blank drag selects intersecting images");
+  imageView.editor.select(pasted.id);
+  imageView.editor.toggleSelection(dropped.id);
+  for (const operation of ["resize", "rotate"] as const) {
+    const before = imageView.editor.snapshot(), frame = selectionFrame(groupEntries())!;
+    const previousFile = new Uint8Array(liveFiles.get("boards/images.pur")!).slice();
+    const center = imageCenter(frame);
+    const start = operation === "resize" ? imageHandles(frame)[4]
+      : rotationHandles(frame, 20 / imageView.renderer.camera.scale)[0];
+    const end = operation === "resize"
+      ? { x: start.x + frame.width / 2, y: start.y + frame.height / 2 }
+      : { x: center.x - (start.y - center.y), y: center.y + (start.x - center.x) };
+    sendGroupPointer("pointerdown", start);
+    sendGroupPointer("pointermove", end);
+    sendGroupPointer("pointerup", end);
+    const after = imageView.editor.snapshot();
+    assert.notDeepEqual(after, before, `group ${operation} changes placements`);
+    imageView.editor.undo();
+    assert.deepEqual(imageView.editor.snapshot(), before, `group ${operation} undoes in one step`);
+    imageView.editor.redo();
+    assert.deepEqual(imageView.editor.snapshot(), after);
+    await new Promise(resolve => setTimeout(resolve, 3200));
+    assert.equal(imageView.editor.dirty, false, `group ${operation} participates in autosave`);
+    const recovery: Array<{ source: string; path: string }> = (savedSettings?.backups as Array<{ source: string; path: string }>)
+      .filter(record => record.source === "boards/images.pur");
+    assert.equal(recovery.length, 1, "group transforms retain one previous backup generation");
+    assert.deepEqual(new Uint8Array(savedFiles.get(recovery[0].path)!), previousFile);
+    const reopened = await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!));
+    for (const expected of after) {
+      const actual = reopened.images.find(image => image.id === expected.id)!;
+      assert.deepEqual(actual.item, Array.from(expected.item));
+      assert.deepEqual(actual.data, Uint8Array.from(expected.content.data));
+      assert.deepEqual(actual.image, Array.from(expected.content.image));
+    }
+    imageView.editor.undo();
+    await imageView.savePurCurrent();
+    const restored = await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!));
+    for (const expected of before)
+      assert.deepEqual(restored.images.find(image => image.id === expected.id)!.item, Array.from(expected.item));
+  }
   for (const [extension, data] of [
     ["gif", gifFixture(true)], ["webp", animatedWebp([])], ["bmp", bmpFixture(true)], ["svg", svgFixture],
     ["heic", heicFixture],

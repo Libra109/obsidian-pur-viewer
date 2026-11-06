@@ -14,7 +14,7 @@ import { svgDataUrl } from "./svg";
 import { disposeHeicWorker, setHeicFallbackHandler } from "./heic";
 
 const VIEW_TYPE = "lazyref-pur-view";
-const BUILD_ID = "0.13.0";
+const BUILD_ID = "0.15.0";
 const IMAGE_TYPES = ["image/heic", "image/heif", "image/svg+xml", "image/gif", "image/webp",
   "image/bmp", "image/x-ms-bmp", "image/jpeg", "image/png"];
 const DEFAULT_AUTOSAVE_SECONDS = 3;
@@ -247,7 +247,9 @@ class PurView extends FileView {
     this.canvas = this.contentEl.createEl("canvas", { cls: "lazyref-pur-canvas" });
     this.canvas.tabIndex = 0;
     this.canvas.setAttribute("aria-label",
-      "PUR画像ボード。閲覧時はドラッグで移動、ピンチまたはホイールで拡大縮小。編集時は画像をドラッグして移動し、角の枠をドラッグして拡縮。");
+      "PUR画像ボード。閲覧時はドラッグで移動、ピンチまたはホイールで拡大縮小。" +
+      "編集時はCtrlまたはCmdクリックで複数選択、Shiftと空白ドラッグで範囲選択。" +
+      "選択画像をドラッグして移動、共通枠のハンドルで等比拡縮、四隅外側で回転。");
     this.registerDomEvent(this.contentEl, "paste", event => {
       if (!this.canAddImages || isEditableTarget(event.target)) return;
       const files = Array.from(event.clipboardData?.items ?? [])
@@ -358,13 +360,19 @@ class PurView extends FileView {
     action("クリップボードから貼り付け", () => this.pasteClipboardImage(), !this.canAddImages);
     action("ストレージから画像を読み込む", () => this.chooseStorageImages(), !this.canAddImages);
     action("保管庫から画像を追加", () => this.chooseVaultImage(), !this.canAddImages);
-    action("選択した画像を削除", () => this.renderer?.removeSelected(), !this.renderer?.canTransformSelected);
+    action("選択した画像を削除", () => this.renderer?.removeSelected(), !this.renderer?.canRemoveSelected);
+    action("左端揃え", () => this.renderer?.alignSelected("left"), !this.renderer?.canAlignSelected);
+    action("右端揃え", () => this.renderer?.alignSelected("right"), !this.renderer?.canAlignSelected);
+    action("上端揃え", () => this.renderer?.alignSelected("top"), !this.renderer?.canAlignSelected);
+    action("下端揃え", () => this.renderer?.alignSelected("bottom"), !this.renderer?.canAlignSelected);
+    action("水平中央揃え", () => this.renderer?.alignSelected("horizontal-center"), !this.renderer?.canAlignSelected);
+    action("垂直中央揃え", () => this.renderer?.alignSelected("vertical-center"), !this.renderer?.canAlignSelected);
     action("元に戻す", () => this.renderer?.undo(), !this.editor?.canUndo);
     action("やり直す", () => this.renderer?.redo(), !this.editor?.canRedo);
     action("90°時計回りに回転", () => this.renderer?.rotateSelected(Math.PI / 2),
-      !this.renderer?.canTransformSelected);
+      !this.renderer?.canRotateSelected);
     action("90°反時計回りに回転", () => this.renderer?.rotateSelected(-Math.PI / 2),
-      !this.renderer?.canTransformSelected);
+      !this.renderer?.canRotateSelected);
     action("左右反転", () => this.renderer?.flipSelected("horizontal"),
       !this.renderer?.canTransformSelected);
     action("上下反転", () => this.renderer?.flipSelected("vertical"),
@@ -923,7 +931,7 @@ class PurView extends FileView {
 
     if (this.editStatus) {
       const mode = this.editButton?.dataset.editing === "true" ? "編集モード" : "閲覧モード";
-      const selection = editor?.selected ? ` / 選択中: ${editor.selected.id}` : "";
+      const selection = editor?.selectedImages.length ? ` / 選択中: ${editor.selectedImages.length}枚` : "";
       const dirty = editor?.dirty ? " / 未保存変更" : "";
       const copy = this.savedCopy ? ` / 保存済みコピー: ${this.savedCopy}（保存時の配置）` : "";
       this.editStatus.setText(`${mode}${selection}${dirty}${copy}`);

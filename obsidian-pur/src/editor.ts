@@ -1,4 +1,4 @@
-import { BoardImage, Matrix } from "./board";
+import { BoardImage, transformedBounds, Matrix } from "./board";
 import { check } from "./binary";
 
 export interface ImageEditState {
@@ -15,7 +15,10 @@ interface PlacementCommand {
   beforeZ: number;
   afterZ: number;
 }
-type EditCommand = PlacementCommand | { kind: "add" | "remove"; image: BoardImage };
+type EditCommand = PlacementCommand | { kind: "add" | "remove"; images: BoardImage[] } |
+  { kind: "batch"; commands: PlacementCommand[] };
+
+export type Alignment = "left" | "right" | "top" | "bottom" | "horizontal-center" | "vertical-center";
 
 function copy(matrix: Matrix): Matrix {
   return [...matrix];
@@ -26,7 +29,15 @@ function same(a: Matrix, b: Matrix): boolean {
 }
 
 export class BoardEditor {
-  selectedId?: number;
+  private readonly selection = new Set<number>();
+  get selectedImages(): BoardImage[] { return this.images.filter(image => this.selection.has(image.id)); }
+  get selectedId(): number | undefined {
+    return this.selection.size === 1 ? this.selection.values().next().value : undefined;
+  }
+  set selectedId(id: number | undefined) {
+    this.selection.clear();
+    if (id !== undefined) this.selection.add(id);
+  }
   private readonly original = new Map<number, Matrix>();
   private readonly originalZ = new Map<number, number>();
   private readonly known = new Map<number, BoardImage>();
@@ -76,9 +87,56 @@ export class BoardEditor {
     return this.images.find(image => image.id === this.selectedId);
   }
   select(id?: number): void {
-    if (this.selectedId === id) return;
+    if (this.selectedId === id && (id !== undefined || !this.selection.size)) return;
     this.selectedId = id;
     this.onChange();
+  }
+  isSelected(id: number): boolean { return this.selection.has(id); }
+  toggleSelection(id: number): void {
+    if (!this.images.some(image => image.id === id)) return;
+    if (this.selection.has(id)) this.selection.delete(id);
+    else this.selection.add(id);
+    this.onChange();
+  }
+  selectIds(ids: number[]): void {
+    const present = new Set(this.images.map(image => image.id));
+    this.selection.clear();
+    for (const id of ids) if (present.has(id)) this.selection.add(id);
+    this.onChange();
+  }
+  commitItems(before: { id: number; item: Matrix }[]): void {
+    const commands: PlacementCommand[] = [];
+    const images = new Map(this.images.map(image => [image.id, image]));
+    for (const state of before) {
+      const image = images.get(state.id);
+      if (image && !same(image.item, state.item))
+        commands.push({ id: image.id, before: copy(state.item), after: copy(image.item),
+          beforeZ: image.z, afterZ: image.z });
+    }
+    if (!commands.length) return;
+    this.undoStack.push({ kind: "batch", commands });
+    this.redoStack = [];
+    this.onChange();
+  }
+  alignSelected(alignment: Alignment): void {
+    const images = this.selectedImages;
+    if (images.length < 2) return;
+    const bounds = transformedBounds(images);
+    const before = images.map(image => ({ id: image.id, item: copy(image.item) }));
+    const after = images.map(image => {
+      const current = transformedBounds([image]);
+      const item = copy(image.item);
+      if (alignment === "left") item[4] += bounds.x - current.x;
+      else if (alignment === "right") item[4] += bounds.x + bounds.width - current.x - current.width;
+      else if (alignment === "top") item[5] += bounds.y - current.y;
+      else if (alignment === "bottom") item[5] += bounds.y + bounds.height - current.y - current.height;
+      else if (alignment === "horizontal-center") item[4] += bounds.x + bounds.width / 2 - current.x - current.width / 2;
+      else item[5] += bounds.y + bounds.height / 2 - current.y - current.height / 2;
+      check(item.every(Number.isFinite), "整列後の画像座標が対応範囲を超えています");
+      return item;
+    });
+    images.forEach((image, index) => { image.item = after[index]; });
+    this.commitItems(before);
   }
   add(content: Omit<BoardImage, "id" | "z">): BoardImage {
     check(Number.isSafeInteger(this.nextId), "画像項目IDが整数の上限に達しています");
@@ -86,17 +144,17 @@ export class BoardEditor {
     this.known.set(image.id, image);
     this.tieOrder.set(image.id, this.tieOrder.size);
     this.images.push(image);
-    this.undoStack.push({ kind: "add", image });
+    this.undoStack.push({ kind: "add", images: [image] });
     this.redoStack = [];
     this.selectedId = image.id;
     this.onChange();
     return image;
   }
   removeSelected(): void {
-    const image = this.selected;
-    if (!image) return;
-    this.images.splice(this.images.indexOf(image), 1);
-    this.undoStack.push({ kind: "remove", image });
+    const images = this.selectedImages;
+    if (!images.length) return;
+    for (const image of images) this.images.splice(this.images.indexOf(image), 1);
+    this.undoStack.push({ kind: "remove", images });
     this.redoStack = [];
     this.selectedId = undefined;
     this.onChange();
@@ -131,6 +189,14 @@ export class BoardEditor {
     image.item = copy(matrix);
     this.onChange();
   }
+  setItems(states: { id: number; item: Matrix }[]): void {
+    const matrices = new Map(states.map(state => [state.id, state.item]));
+    for (const image of this.images) {
+      const matrix = matrices.get(image.id);
+      if (matrix) image.item = copy(matrix);
+    }
+    this.onChange();
+  }
   commit(id: number, before: Matrix): void {
     const image = this.images.find(item => item.id === id);
     if (!image || same(image.item, before)) return;
@@ -149,27 +215,31 @@ export class BoardEditor {
     const command = this.undoStack.pop();
     if (!command) return;
     this.redoStack.push(command);
-    if ("kind" in command) {
-      this.applyMembership(command.image, command.kind === "remove");
-      return;
-    }
-    const image = this.images.find(image => image.id === command.id)!;
-    image.z = command.beforeZ;
+    this.applyCommand(command, false);
     this.sortImages();
-    this.setItem(command.id, command.before);
+    this.onChange();
   }
   redo(): void {
     const command = this.redoStack.pop();
     if (!command) return;
     this.undoStack.push(command);
-    if ("kind" in command) {
-      this.applyMembership(command.image, command.kind === "add");
+    this.applyCommand(command, true);
+    this.sortImages();
+    this.onChange();
+  }
+  private applyCommand(command: EditCommand, forward: boolean): void {
+    if ("kind" in command && command.kind !== "batch") {
+      const present = forward === (command.kind === "add");
+      if (present) this.selection.clear();
+      for (const image of command.images) this.applyMembership(image, present);
       return;
     }
-    const image = this.images.find(image => image.id === command.id)!;
-    image.z = command.afterZ;
-    this.sortImages();
-    this.setItem(command.id, command.after);
+    const images = new Map(this.images.map(image => [image.id, image]));
+    for (const placement of "kind" in command ? command.commands : [command]) {
+      const image = images.get(placement.id)!;
+      image.z = forward ? placement.afterZ : placement.beforeZ;
+      image.item = copy(forward ? placement.after : placement.before);
+    }
   }
   discard(): void {
     this.images.splice(0, this.images.length, ...[...this.original.keys()].map(id => this.known.get(id)!));
@@ -180,18 +250,16 @@ export class BoardEditor {
     this.sortImages();
     this.undoStack = [];
     this.redoStack = [];
-    if (!this.selected) this.selectedId = undefined;
+    for (const id of this.selection) if (!this.images.some(image => image.id === id)) this.selection.delete(id);
     this.onChange();
   }
   private applyMembership(image: BoardImage, present: boolean): void {
     if (present) {
       this.images.push(image);
-      this.selectedId = image.id;
-      this.sortImages();
+      this.selection.add(image.id);
     } else {
       this.images.splice(this.images.indexOf(image), 1);
-      if (this.selectedId === image.id) this.selectedId = undefined;
+      this.selection.delete(image.id);
     }
-    this.onChange();
   }
 }

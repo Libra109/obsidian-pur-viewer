@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { BoardImage } from "../src/board";
-import { BoardEditor } from "../src/editor";
+import { BoardImage, Matrix, transformedBounds } from "../src/board";
+import { Alignment, BoardEditor } from "../src/editor";
 
 function image(id: number, x: number): BoardImage {
   return {
@@ -224,4 +224,100 @@ test("saving additions and removals preserves concurrent membership changes and 
   assert.equal(editor.dirty, false);
   editor.discard();
   assert.deepEqual(editor.images, [added]);
+});
+
+test("selection toggles, clearing, group movement and deletion preserve a single undo step", () => {
+  const first = image(1, 0), second = image(2, 100), third = image(3, 300);
+  const editor = new BoardEditor([first, second, third]);
+  editor.select(1);
+  editor.toggleSelection(2);
+  assert.deepEqual(editor.selectedImages, [first, second]);
+  assert.equal(editor.selected, undefined, "single-image transforms are unavailable for groups");
+  assert.equal(editor.dirty, false);
+  editor.toggleSelection(2);
+  assert.equal(editor.selected, first);
+  editor.toggleSelection(2);
+  const before = editor.snapshot();
+  for (const state of before.slice(0, 2)) {
+    const item: Matrix = [...state.item];
+    item[4] += 15; item[5] -= 20;
+    editor.setItem(state.id, item);
+  }
+  editor.commitItems(before.slice(0, 2));
+  assert.equal(second.item[4] - first.item[4], 100);
+  editor.undo();
+  assert.deepEqual(editor.snapshot(), before);
+  assert.equal(editor.canUndo, false);
+  assert.deepEqual(editor.selectedImages, [first, second]);
+  editor.redo();
+  assert.equal(first.item[4], 15);
+  assert.equal(second.item[5], -20);
+  editor.removeSelected();
+  assert.deepEqual(editor.images, [third]);
+  editor.undo();
+  assert.deepEqual(editor.selectedImages, [first, second]);
+  editor.redo();
+  assert.equal(editor.selectedImages.length, 0);
+  editor.undo();
+  editor.select();
+  assert.equal(editor.selectedImages.length, 0);
+  editor.select(3);
+  assert.equal(editor.selected, third);
+  editor.toggleSelection(999);
+  assert.equal(editor.selected, third);
+});
+
+for (const alignment of ["left", "right", "top", "bottom", "horizontal-center", "vertical-center"] as Alignment[]) {
+  test(`${alignment} aligns transformed bounds with translation only and restores the entire operation`, () => {
+    const first = image(1, -60), second = image(2, 100), third = image(3, 400);
+    first.item = [0, 2, -3, 0, -60, 25];
+    first.image = [1, 0.1, 0.2, 1, -32, -24];
+    second.item = [0.005, 0, 0, 0.01, 100, -90];
+    third.item = [-1, 0.3, 0.4, 2, 400, 180];
+    const editor = new BoardEditor([first, second, third]);
+    editor.select(1);
+    editor.toggleSelection(2);
+    editor.toggleSelection(3);
+    const before = editor.snapshot(), bounds = transformedBounds(editor.images);
+    const value = (b: ReturnType<typeof transformedBounds>) => alignment === "left" ? b.x :
+      alignment === "right" ? b.x + b.width : alignment === "top" ? b.y :
+      alignment === "bottom" ? b.y + b.height : alignment === "horizontal-center" ? b.x + b.width / 2 :
+      b.y + b.height / 2;
+    editor.alignSelected(alignment);
+    for (const [index, entry] of editor.images.entries()) {
+      assert.ok(Math.abs(value(transformedBounds([entry])) - value(bounds)) < 1e-9);
+      assert.deepEqual(entry.item.slice(0, 4), before[index].item.slice(0, 4));
+      assert.deepEqual(entry.image, before[index].content.image);
+      assert.equal(entry.z, before[index].z);
+      assert.equal(entry.item[alignment === "left" || alignment === "right" ||
+        alignment === "horizontal-center" ? 5 : 4],
+      before[index].item[alignment === "left" || alignment === "right" ||
+        alignment === "horizontal-center" ? 5 : 4], "orthogonal position is unchanged");
+    }
+    const aligned = editor.snapshot();
+    assert.equal(editor.dirty, true);
+    editor.undo();
+    assert.deepEqual(editor.snapshot(), before);
+    assert.equal(editor.canUndo, false);
+    assert.equal(editor.dirty, false);
+    editor.redo();
+    assert.deepEqual(editor.snapshot(), aligned);
+    editor.acceptSaved(aligned);
+    assert.equal(editor.dirty, false);
+    editor.undo();
+    assert.equal(editor.dirty, true);
+    editor.redo();
+    assert.equal(editor.dirty, false);
+  });
+}
+
+test("alignment with zero or one selected image and an already aligned group has no history", () => {
+  const editor = new BoardEditor([image(1, 0), image(2, 0)]);
+  editor.alignSelected("left");
+  editor.select(1);
+  editor.alignSelected("left");
+  editor.toggleSelection(2);
+  editor.alignSelected("left");
+  assert.equal(editor.canUndo, false);
+  assert.equal(editor.dirty, false);
 });

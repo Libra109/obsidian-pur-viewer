@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { BoardImage, Matrix, multiply, transform } from "../src/board";
 import {
-  flipItem, imageCenter, imageHandles, resizeCursor, resizeFromHandle, rotateMatrixAboutPoint, rotationHandles,
+  flipItem, imageCenter, imageHandles, intersectsSelection, resizeCursor, resizeFromHandle,
+  rotateMatrixAboutPoint, rotationHandles, selectionFrame,
 } from "../src/handles";
 
 test("all eight handles scale uniformly around the opposite handle, preserving affine geometry", () => {
@@ -106,4 +107,69 @@ test("horizontal and vertical flips keep the image center fixed and flip its sou
   const flippedBottom = transform(verticalComposite, { x: image.width / 2, y: image.height });
   assert.ok(Math.hypot(flippedTop.x - bottom.x, flippedTop.y - bottom.y) < 1e-10);
   assert.ok(Math.hypot(flippedBottom.x - top.x, flippedBottom.y - top.y) < 1e-10);
+});
+
+test("marquee tests the transformed quadrilateral, not its bounding box or clipping path", () => {
+  const image: BoardImage = { id: 1, width: 100, height: 100, item: [1, 1, -1, 1, 100, 0],
+    image: [1, 0, 0, 1, 0, 0], data: new Uint8Array(), mime: "image/png", opacity: 1, z: 0,
+    clip: { elements: [{ type: 0, x: 90, y: 90 }], fillRule: "evenodd" } };
+  assert.equal(intersectsSelection(image, { x: 0, y: 0 }, { x: 20, y: 20 }), false,
+    "an empty corner of the AABB must not count as an intersection");
+  assert.equal(intersectsSelection(image, { x: 99, y: -10 }, { x: 101, y: 1 }), true,
+    "a tiny overlap is sufficient");
+  assert.equal(intersectsSelection(image, { x: 101, y: 1 }, { x: 99, y: -10 }), true,
+    "reverse drags have the same meaning");
+  assert.equal(intersectsSelection(image, { x: 98, y: 98 }, { x: 102, y: 102 }), true,
+    "a rectangle contained inside an image intersects");
+  assert.equal(intersectsSelection(image, { x: -1, y: -1 }, { x: 201, y: 201 }), true);
+  image.item = [-1, 0.3, 0.8, 2, 300, -20];
+  image.image = [0.8, 0.2, -0.1, 0.9, 3, 4];
+  const center = imageCenter(image);
+  assert.equal(intersectsSelection(image, { x: center.x - 1, y: center.y - 1 },
+    { x: center.x + 1, y: center.y + 1 }), true, "reflection, shear and image-local transforms compose");
+});
+
+test("a common selection frame scales and rotates all affine images without changing image-local transforms", () => {
+  const images: BoardImage[] = [
+    { id: 1, width: 64, height: 48, item: [0, 2, -3, 0, -50, 20],
+      image: [0.8, 0.2, -0.1, 0.9, 3, 4], data: new Uint8Array(), mime: "image/png", opacity: 1, z: 0 },
+    { id: 2, width: 64, height: 48, item: [-2, 0.3, 0.5, 1, 100, -90],
+      image: [1, -0.1, 0.2, 0.9, -32, -24], data: new Uint8Array(), mime: "image/png", opacity: 1, z: 1 },
+  ];
+  assert.equal(selectionFrame([]), undefined);
+  assert.equal(selectionFrame([images[0]]), images[0], "single-image handles retain their exact affine geometry");
+  const frame = selectionFrame(images)!, handles = imageHandles(frame);
+  for (let index = 0; index < 8; index++) {
+    const handle = handles[index], anchor = handles[(index + 4) % 8];
+    const vector = { x: handle.x - anchor.x, y: handle.y - anchor.y };
+    for (const factor of [0.05, 0.5, 1.5, 20]) {
+      const end = { x: handle.x + vector.x * (factor - 1), y: handle.y + vector.y * (factor - 1) };
+      const resizedFrame = { ...frame, item: resizeFromHandle(frame.item, anchor, vector, handle, end) };
+      const afterHandles = imageHandles(resizedFrame);
+      assert.ok(Math.hypot(afterHandles[(index + 4) % 8].x - anchor.x,
+        afterHandles[(index + 4) % 8].y - anchor.y) < 1e-8);
+      for (const image of images) {
+        const after = { ...image, item: resizeFromHandle(image.item, anchor, vector, handle, end) };
+        const originalHandles = imageHandles(image);
+        imageHandles(after).forEach((point, i) => {
+          assert.ok(Math.abs(point.x - anchor.x - (originalHandles[i].x - anchor.x) * factor) < 1e-8);
+          assert.ok(Math.abs(point.y - anchor.y - (originalHandles[i].y - anchor.y) * factor) < 1e-8);
+        });
+        assert.deepEqual(after.image, image.image);
+      }
+    }
+  }
+  const center = imageCenter(frame);
+  for (const angle of [-Math.PI / 2, 0.7, Math.PI * 2.2]) {
+    for (const image of images) {
+      const rotated = { ...image, item: rotateMatrixAboutPoint(image.item, center, angle) };
+      const rotation: Matrix = [Math.cos(angle), Math.sin(angle), -Math.sin(angle), Math.cos(angle),
+        center.x - Math.cos(angle) * center.x + Math.sin(angle) * center.y,
+        center.y - Math.sin(angle) * center.x - Math.cos(angle) * center.y];
+      const expected = imageHandles(image).map(point => transform(rotation, point));
+      imageHandles(rotated).forEach((point, i) =>
+        assert.ok(Math.hypot(point.x - expected[i].x, point.y - expected[i].y) < 1e-8));
+      assert.deepEqual(rotated.image, image.image);
+    }
+  }
 });

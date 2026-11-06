@@ -1,11 +1,12 @@
 import { check } from "./binary";
 import { BoardImage, boardBounds, Bounds, Clip, invert, Matrix, multiply, Point, transform } from "./board";
 import { Camera, gesturePoints } from "./camera";
-import { BoardEditor } from "./editor";
+import { Alignment, BoardEditor } from "./editor";
 import { drawGrid } from "./grid";
 import { decodeRaster, imageDimensions } from "./image-import";
 import {
-  flipItem, imageCenter, imageHandles, resizeCursor, resizeFromHandle, rotateMatrixAboutPoint, rotationHandles,
+  flipItem, imageCenter, imageHandles, ImageGeometry, intersectsSelection, resizeCursor, resizeFromHandle,
+  rotateMatrixAboutPoint, rotationHandles, selectionFrame,
 } from "./handles";
 
 export interface DecodedImage { image: BoardImage; bitmap: ImageBitmap }
@@ -74,37 +75,41 @@ export function drawBoard(context: CanvasRenderingContext2D, images: DecodedImag
   context.restore();
 }
 
-function drawSelection(context: CanvasRenderingContext2D, editor: BoardEditor, camera: Camera): void {
-  const image = editor.selected;
-  if (!image) return;
-  const handles = imageHandles(image).map(world => {
-    return { x: world.x * camera.scale + camera.x, y: world.y * camera.scale + camera.y };
-  });
-  const corners = handles.filter((_, i) => i % 2 === 0);
-  context.save();
-  context.strokeStyle = "#64b5f6";
-  context.fillStyle = "#64b5f6";
-  context.lineWidth = 1;
-  context.setLineDash([]);
-  context.beginPath();
-  context.moveTo(corners[0].x, corners[0].y);
-  for (const point of corners.slice(1)) context.lineTo(point.x, point.y);
-  context.closePath();
-  context.stroke();
-  for (const handle of handles) {
+function drawSelection(context: CanvasRenderingContext2D, image: ImageGeometry | undefined, camera: Camera): void {
+  if (image) {
+    const handles = imageHandles(image).map(world => {
+      return { x: world.x * camera.scale + camera.x, y: world.y * camera.scale + camera.y };
+    });
+    const corners = handles.filter((_, i) => i % 2 === 0);
+    context.save();
+    context.strokeStyle = "#64b5f6";
+    context.fillStyle = "#64b5f6";
+    context.lineWidth = 1;
+    context.setLineDash([]);
     context.beginPath();
-    context.arc(handle.x, handle.y, 3, 0, Math.PI * 2);
-    context.fill();
+    context.moveTo(corners[0].x, corners[0].y);
+    for (const point of corners.slice(1)) context.lineTo(point.x, point.y);
+    context.closePath();
     context.stroke();
+    for (const handle of handles) {
+      context.beginPath();
+      context.arc(handle.x, handle.y, 3, 0, Math.PI * 2);
+      context.fill();
+      context.stroke();
+    }
+    context.restore();
   }
-  context.restore();
 }
 
 type Gesture =
   | { kind: "camera" }
-  | { kind: "move"; id: number; before: Matrix; start: Point }
-  | { kind: "resize"; id: number; index: number; before: Matrix; anchor: Point; vector: Point; start: Point }
-  | { kind: "rotate"; id: number; before: Matrix; center: Point; lastAngle: number; angle: number };
+  | { kind: "selection" }
+  | { kind: "marquee"; start: Point; current: Point }
+  | { kind: "move"; before: { id: number; item: Matrix }[]; start: Point; frame: ImageGeometry }
+  | { kind: "resize"; before: { id: number; item: Matrix }[]; frame: ImageGeometry;
+      index: number; anchor: Point; vector: Point; start: Point }
+  | { kind: "rotate"; before: { id: number; item: Matrix }[]; frame: ImageGeometry;
+      center: Point; lastAngle: number; angle: number };
 
 interface TransformDiagnostic {
   kind: "resize" | "rotate";
@@ -128,6 +133,24 @@ export class BoardRenderer {
   private pendingFront?: number;
   private readonly tieOrder = new Map<number, number>();
   private transformDiagnostic?: TransformDiagnostic;
+  private groupFrame?: { geometry: ImageGeometry; states: { id: number; item: Matrix }[] };
+
+  private selectionGeometry(): ImageGeometry | undefined {
+    const images = this.editor.selectedImages;
+    if (images.length < 2) { this.groupFrame = undefined; return images[0]; }
+    const cached = this.groupFrame;
+    if (cached && images.length === cached.states.length && images.every((image, index) =>
+      image.id === cached.states[index].id && image.item.every((value, i) => value === cached.states[index].item[i])))
+      return cached.geometry;
+    const geometry = selectionFrame(images)!;
+    this.rememberFrame(geometry);
+    return geometry;
+  }
+
+  private rememberFrame(geometry: ImageGeometry): void {
+    if (this.editor.selectedImages.length < 2) return;
+    this.groupFrame = { geometry, states: this.editor.selectedImages.map(image => ({ id: image.id, item: [...image.item] })) };
+  }
 
   constructor(
     private readonly canvas: HTMLCanvasElement,
@@ -155,14 +178,14 @@ export class BoardRenderer {
       const gesture = this.gesture;
       if (gesture.kind === "rotate") this.canvas.style.cursor = ROTATION_CURSOR;
       else if (gesture.kind === "resize") {
-        const image = this.editor.images.find(image => image.id === gesture.id);
+        const image = this.selectionGeometry();
         if (image) this.canvas.style.cursor = resizeCursor(image, gesture.index);
       }
       else if (gesture.kind === "move" || this.pointers.size > 0) this.canvas.style.cursor = "grabbing";
     };
     const setHoverCursor = (screen: Point, pointerType: string) => {
       if (pointerType === "touch" || this.pointers.size) return;
-      const selected = this.editing ? this.editor.selected : undefined;
+      const selected = this.editing ? this.selectionGeometry() : undefined;
       const handles = selected ? imageHandles(selected) : [];
       const resizeRadius = 9;
       const resizeCandidates = handles.map((world, index) => ({
@@ -199,7 +222,10 @@ export class BoardRenderer {
         this.gesture = { kind: "camera" };
       } else if (this.editing && event.button === 0) {
         const p = point(event);
-        const selected = this.editor.selected;
+        const modified = event.ctrlKey || event.metaKey;
+        const hit = this.hitTest(p);
+        const marquee = event.shiftKey && !hit;
+        const selected = modified || marquee ? undefined : this.selectionGeometry();
         const handles = selected ? imageHandles(selected) : [];
         const resizeRadius = event.pointerType === "touch" ? 22 : 9;
         const resizeCandidates = handles.map((world, index) => ({
@@ -224,24 +250,36 @@ export class BoardRenderer {
           const world = this.worldPoint(p), center = imageCenter(selected);
           const angle = Math.atan2(world.y - center.y, world.x - center.x);
           this.gesture = {
-            kind: "rotate", id: selected.id, before: [...selected.item], center,
+            kind: "rotate", before: this.editor.selectedImages.map(image => ({ id: image.id, item: [...image.item] })),
+            frame: { ...selected, item: [...selected.item] }, center,
             lastAngle: angle, angle: 0,
           };
         } else if (selected && nearest?.kind === "resize") {
           const handle = handles[nearest.index], anchor = handles[(nearest.index + 4) % 8];
           this.gesture = {
-            kind: "resize", id: selected.id, index: nearest.index, before: [...selected.item], anchor,
+            kind: "resize", before: this.editor.selectedImages.map(image => ({ id: image.id, item: [...image.item] })),
+            frame: { ...selected, item: [...selected.item] }, index: nearest.index, anchor,
             vector: { x: handle.x - anchor.x, y: handle.y - anchor.y },
             start: this.worldPoint(p),
           };
         } else {
-          const hit = this.hitTest(p);
-          this.editor.select(hit?.id);
-          if (hit) {
-            this.pendingFront = hit.id;
-            this.gesture = { kind: "move", id: hit.id, before: [...hit.item], start: p };
+          if (marquee) {
+            const start = this.worldPoint(p);
+            this.gesture = { kind: "marquee", start, current: start };
+          } else if (modified) {
+            if (hit) this.editor.toggleSelection(hit.id);
+            this.gesture = { kind: "selection" };
+          } else if (hit) {
+            if (!this.editor.isSelected(hit.id)) this.editor.select(hit.id);
+            if (this.editor.selected) this.pendingFront = hit.id;
+            this.gesture = { kind: "move",
+              before: this.editor.selectedImages.map(image => ({ id: image.id, item: [...image.item] })),
+              start: p, frame: this.selectionGeometry()! };
           }
-          else this.gesture = { kind: "camera" };
+          else {
+            this.editor.select();
+            this.gesture = { kind: "camera" };
+          }
           this.render();
         }
       } else this.gesture = { kind: "camera" };
@@ -264,22 +302,38 @@ export class BoardRenderer {
       this.pointers.set(event.pointerId, point(event));
       if (this.gesture.kind === "resize" || this.gesture.kind === "rotate")
         this.transformDiagnostic && this.transformDiagnostic.pointerMoves++;
+      if (this.pointers.size === 1 && this.gesture.kind === "marquee") {
+        this.gesture.current = this.worldPoint(point(event));
+        this.renderImmediately();
+        return;
+      }
       if (this.pointers.size === 1 && this.gesture.kind === "move") {
         this.promotePending();
         const p = this.pointers.get(event.pointerId)!;
         const deltaX = (p.x - this.gesture.start.x) / this.camera.scale;
         const deltaY = (p.y - this.gesture.start.y) / this.camera.scale;
-        const matrix = [...this.gesture.before] as Matrix;
-        matrix[4] += deltaX;
-        matrix[5] += deltaY;
-        this.editor.setItem(this.gesture.id, matrix);
+        this.editor.setItems(this.gesture.before.map(state => {
+          const matrix = [...state.item] as Matrix;
+          matrix[4] += deltaX;
+          matrix[5] += deltaY;
+          return { id: state.id, item: matrix };
+        }));
+        const frame = this.gesture.frame;
+        const item: Matrix = [...frame.item];
+        item[4] += deltaX; item[5] += deltaY;
+        this.rememberFrame({ ...frame, item });
         this.renderImmediately();
         return;
       }
       if (this.pointers.size === 1 && this.gesture.kind === "resize") {
         const p = this.pointers.get(event.pointerId)!;
-        this.editor.setItem(this.gesture.id, resizeFromHandle(this.gesture.before,
-          this.gesture.anchor, this.gesture.vector, this.gesture.start, this.worldPoint(p)));
+        const gesture = this.gesture;
+        const current = this.worldPoint(p);
+        this.editor.setItems(gesture.before.map(state => ({ id: state.id,
+          item: resizeFromHandle(state.item, gesture.anchor, gesture.vector, gesture.start, current) })));
+        this.rememberFrame({ ...gesture.frame, item: resizeFromHandle(gesture.frame.item,
+          gesture.anchor, gesture.vector, gesture.start, current) });
+        setGestureCursor();
         this.renderImmediately();
         return;
       }
@@ -291,11 +345,17 @@ export class BoardRenderer {
         else if (delta < -Math.PI) delta += Math.PI * 2;
         this.gesture.lastAngle = angle;
         this.gesture.angle += delta;
-        this.editor.setItem(this.gesture.id,
-          rotateMatrixAboutPoint(this.gesture.before, this.gesture.center, this.gesture.angle));
+        const gesture = this.gesture;
+        const states = gesture.before.map(state => ({ id: state.id,
+          item: rotateMatrixAboutPoint(state.item, gesture.center, gesture.angle) }));
+        const frame = { ...gesture.frame,
+          item: rotateMatrixAboutPoint(gesture.frame.item, gesture.center, gesture.angle) };
+        this.editor.setItems(states);
+        this.rememberFrame(frame);
         this.renderImmediately();
         return;
       }
+      if (this.gesture.kind === "selection" && this.pointers.size === 1) return;
       if (this.pointers.size < 2) {
         this.camera.gesture(beforePoints[0], this.pointers.get(event.pointerId)!, 1);
         this.render();
@@ -308,6 +368,13 @@ export class BoardRenderer {
       this.render();
     }, { signal });
     const release = (event: PointerEvent) => {
+      if (event.type === "pointerup" && this.pointers.size === 1 &&
+        this.pointers.has(event.pointerId) && this.gesture.kind === "marquee") {
+        const start = this.gesture.start, end = this.worldPoint(point(event));
+        this.editor.selectIds(this.editor.images.filter(image =>
+          intersectsSelection(image, start, end))
+          .map(image => image.id));
+      }
       if (event.type === "pointerup" && this.pointers.size === 1) this.promotePending();
       else this.pendingFront = undefined;
       if (this.pointers.has(event.pointerId)) this.commitGesture();
@@ -330,10 +397,15 @@ export class BoardRenderer {
       this.render();
     }, { passive: false, signal });
     canvas.addEventListener("keydown", event => {
+      if (event.target !== canvas) return;
       if (this.editing && !event.ctrlKey && !event.metaKey && !event.altKey &&
         (event.key === "Delete" || event.key === "Backspace")) {
-        if (!this.editor.selected) return;
+        if (!this.editor.selectedImages.length) return;
         this.removeSelected();
+      } else if (this.editing && event.key === "Escape") {
+        this.finishPendingEdit();
+        this.editor.select();
+        this.render();
       } else if (this.editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
         if (event.shiftKey) this.redo(); else this.undo();
       } else if (this.editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") this.redo();
@@ -384,6 +456,16 @@ export class BoardRenderer {
   }
 
   get canTransformSelected(): boolean { return this.editing && this.editor.selected !== undefined; }
+  get canRotateSelected(): boolean { return this.editing && this.editor.selectedImages.length > 0; }
+  get canRemoveSelected(): boolean { return this.editing && this.editor.selectedImages.length > 0; }
+  get canAlignSelected(): boolean { return this.editing && this.editor.selectedImages.length > 1; }
+  alignSelected(alignment: Alignment): void {
+    if (!this.canAlignSelected) return;
+    this.finishPendingEdit();
+    try { this.editor.alignSelected(alignment); }
+    catch (error) { this.onError(error); }
+    this.render();
+  }
   get retainedPixels(): number {
     return this.images.reduce((sum, entry) => sum + entry.bitmap.width * entry.bitmap.height, 0);
   }
@@ -404,15 +486,21 @@ export class BoardRenderer {
     this.renderImmediately();
   }
   removeSelected(): void {
-    if (!this.canTransformSelected) return;
+    if (!this.canRemoveSelected) return;
     this.finishPendingEdit();
     this.editor.removeSelected();
     this.renderImmediately();
   }
   rotateSelected(angle: number): void {
-    const image = this.editor.selected;
-    if (!this.canTransformSelected || !image) return;
-    this.editor.transformItem(image.id, rotateMatrixAboutPoint(image.item, imageCenter(image), angle));
+    if (!this.canRotateSelected) return;
+    this.finishPendingEdit();
+    const frame = this.selectionGeometry()!, center = imageCenter(frame);
+    const before = this.editor.selectedImages.map(image => ({ id: image.id, item: [...image.item] as Matrix }));
+    const states = before.map(state => ({ id: state.id, item: rotateMatrixAboutPoint(state.item, center, angle) }));
+    const rotated = { ...frame, item: rotateMatrixAboutPoint(frame.item, center, angle) };
+    this.editor.setItems(states);
+    this.rememberFrame(rotated);
+    this.editor.commitItems(before);
     this.render();
   }
   flipSelected(axis: "horizontal" | "vertical"): void {
@@ -459,7 +547,22 @@ export class BoardRenderer {
       this.sortDecodedImages();
       drawBoard(context, this.activeImages(), this.camera);
       if (this.editing) {
-        drawSelection(context, this.editor, this.camera);
+        drawSelection(context, this.selectionGeometry(), this.camera);
+        if (this.gesture.kind === "marquee") {
+          const { start, current } = this.gesture;
+          context.save();
+          context.strokeStyle = "#64b5f6";
+          context.fillStyle = "rgba(100,181,246,0.12)";
+          context.lineWidth = 1;
+          context.setLineDash([4, 4]);
+          const x = start.x * this.camera.scale + this.camera.x;
+          const y = start.y * this.camera.scale + this.camera.y;
+          const width = (current.x - start.x) * this.camera.scale;
+          const height = (current.y - start.y) * this.camera.scale;
+          context.fillRect(x, y, width, height);
+          context.strokeRect(x, y, width, height);
+          context.restore();
+        }
       }
       if (diagnostic) diagnostic.renderedFrames++;
       this.onState(`frame drawn; canvas ${this.canvas.clientWidth} x ${this.canvas.clientHeight}; images ${this.editor.images.length}`);
@@ -492,8 +595,8 @@ export class BoardRenderer {
       const diagnostic = this.transformDiagnostic;
       this.transformDiagnostic = undefined;
       if (diagnostic) {
-        const image = this.editor.images.find(item => item.id === gesture.id);
-        const matrix = image?.item.map(value => Number(value.toFixed(4))).join(",") ?? "missing";
+        const matrix = this.editor.images.find(item => item.id === gesture.before[0]?.id)?.item
+          .map(value => Number(value.toFixed(4))).join(",") ?? "missing";
         this.onInteractionDiagnostic(
           `${diagnostic.kind} gesture ended; pointerMoves=${diagnostic.pointerMoves}; ` +
           `drawCalls=${diagnostic.drawCalls}; renderedFrames=${diagnostic.renderedFrames}; item=${matrix}`,
@@ -501,7 +604,7 @@ export class BoardRenderer {
       }
     }
     if (gesture.kind === "move" || gesture.kind === "resize" || gesture.kind === "rotate")
-      this.editor.commit(gesture.id, gesture.before);
+      this.editor.commitItems(gesture.before);
   }
   private promotePending(): void {
     const id = this.pendingFront;
