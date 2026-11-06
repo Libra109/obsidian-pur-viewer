@@ -1,6 +1,6 @@
 {
   "name": "obsidian-lazyref-pur",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "private": true,
   "description": "PureRef board viewer and placement editor for desktop and mobile Obsidian",
   "scripts": {

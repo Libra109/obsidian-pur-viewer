@@ -71,6 +71,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   const menuActions: (() => void)[] = [];
   const titledActions = new Map<string, () => void>();
   const menuChecks = new Map<string, boolean>();
+  const menuDisabled = new Map<string, boolean>();
   interface CommandStub { id: string; name: string; hotkeys?: unknown[]; callback?: () => void; checkCallback?: (checking: boolean) => boolean }
   const commands: CommandStub[] = [];
   const notices: string[] = [];
@@ -110,6 +111,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   const canvasHandlers = new Map<ElementStub, Map<string, (event: unknown) => void>>();
   let imagePicker: { getItems(): FakeTFile[]; onChooseItem(file: FakeTFile): void } | undefined;
   let savedNotice: (() => void) | undefined;
+  let systemPicker: (() => void) | undefined;
   const fixture = readFileSync(new URL("../../crates/purcore/tests/fixtures/S1_redbar-new.pur", import.meta.url));
   const heicFixture = new Uint8Array(readFileSync(new URL("./fixtures/example.heic", import.meta.url)));
   let closedBitmaps = 0;
@@ -119,6 +121,9 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     devicePixelRatio: 1,
     requestAnimationFrame: () => 1,
     cancelAnimationFrame: () => {},
+    navigator: { clipboard: undefined as undefined | { read(): Promise<Array<{
+      types: string[]; getType(type: string): Promise<Blob>;
+    }>> } },
   };
   interface TestView {
     scope: Scope;
@@ -160,6 +165,15 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     get basename() { return this.path.split("/").pop()?.replace(/\.pur$/, "") ?? ""; }
   }
   class ElementStub {
+    type = "";
+    accept = "";
+    multiple = false;
+    files: unknown[] | null = null;
+    removed = false;
+    pickerOpened = false;
+    showPicker?: () => void;
+    click() { this.pickerOpened = true; }
+    remove() { this.removed = true; }
     isContentEditable = false;
     closest() { return ["input", "textarea", "select"].includes(this.tagName) ? this : null; }
     textContent = "";
@@ -183,7 +197,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
       child.tagName = tag;
       child.value = options?.value ?? "";
       if (tag === "textarea") diagnosticOutputs.push(child);
-      if (tag === "input") inputs.push(child);
+      if (tag === "input") { inputs.push(child); child.showPicker = systemPicker; }
       return child;
     }
     createSpan(_options?: unknown) { return this.child(); }
@@ -215,7 +229,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     title = "";
     setTitle(title: string) { this.title = title; return this; }
     setIcon(_icon: string) { return this; }
-    setDisabled(_disabled: boolean) { return this; }
+    setDisabled(disabled: boolean) { menuDisabled.set(this.title, disabled); return this; }
     setChecked(checked: boolean) { menuChecks.set(this.title, checked); return this; }
     onClick(callback: () => void) {
       menuActions.push(callback);
@@ -522,7 +536,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.ok(diagnosticsCommand);
   diagnosticsCommand.callback!();
   const diagnosticNotice = diagnosticOutputs[diagnosticOutputs.length - 1]?.value ?? "";
-  assert.ok(diagnosticNotice.includes("ビルド: 0.12.0"));
+  assert.ok(diagnosticNotice.includes("ビルド: 0.13.0"));
   assert.ok(diagnosticNotice.includes("ファイル読込 failed"));
   const first = new FakeTFile("boards/first.pur");
   const second = new FakeTFile("boards/second.pur");
@@ -1125,6 +1139,158 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.match(diagnosticOutputs[diagnosticOutputs.length - 1]!.value, /frame drawn/);
   assert.equal(liveFiles.get(savedImageFile.path), savedImageBytes, "opening PUR does not rewrite its bytes");
   await reopenedView.onClose();
+  const menuView = createView({});
+  const menuFile = new FakeTFile("boards/menu-imports.pur");
+  liveFiles.set(menuFile.path, Uint8Array.from(fixture).buffer);
+  await menuView.onOpen();
+  await menuView.setState({ file: menuFile.path });
+  menuView.onPaneMenu(new MenuStub(), "more-options");
+  const menuCanvas = menuView.contentEl.children[3];
+  titledActions.delete("クリップボードから貼り付け");
+  domHandlers.get(menuCanvas)!.get("contextmenu")!({ preventDefault() {} });
+  assert.ok(titledActions.has("クリップボードから貼り付け"), "right-click shares image import actions");
+  titledActions.delete("ストレージから画像を読み込む");
+  domHandlers.get(menuCanvas)!.get("pointerdown")!({
+    pointerType: "touch", isPrimary: true, clientX: 10, clientY: 20,
+  });
+  await new Promise(resolve => setTimeout(resolve, 700));
+  assert.ok(titledActions.has("ストレージから画像を読み込む"), "tablet long press shares image import actions");
+  domHandlers.get(menuCanvas)!.get("pointerup")!({});
+  assert.equal(menuDisabled.get("クリップボードから貼り付け"), false);
+  assert.equal(menuDisabled.get("ストレージから画像を読み込む"), false);
+  const menuPaste = titledActions.get("クリップボードから貼り付け")!;
+  const storage = titledActions.get("ストレージから画像を読み込む")!;
+  const last = <T>(items: T[]): T => items[items.length - 1];
+  await menuPaste();
+  assert.ok(notices.some(message => message.includes("クリップボード読取APIを利用できません")));
+  ownerWindow.navigator.clipboard = { read: async () => { throw new DOMException("denied", "NotAllowedError"); } };
+  await menuPaste();
+  assert.ok(notices.some(message => message.includes("クリップボードの読取を拒否")));
+  ownerWindow.navigator.clipboard = { read: async () => [] };
+  await menuPaste();
+  assert.ok(notices.some(message => message.includes("対応画像またはSVGデータURLがありません")));
+  for (const [mime, data] of [
+    ["image/png", png],
+    ["image/jpeg", new Uint8Array([255, 216, 255, 224, 0, 4, 0, 0,
+      255, 192, 0, 11, 8, 0, 48, 0, 64, 1, 1, 17, 0])],
+    ["image/gif", gifFixture(true)], ["image/webp", animatedWebp([])],
+    ["image/bmp", bmpFixture(true)], ["image/svg+xml", svgFixture], ["image/heic", heicFixture],
+  ] as const) {
+    const beforeCount = menuView.editor.snapshot().length;
+    const byteCopy = data.slice();
+    let readStarted = false;
+    ownerWindow.navigator.clipboard = { read: () => {
+      readStarted = true;
+      return Promise.resolve([{ types: mime === "image/png" ? [mime] : ["image/png", mime],
+        getType: async type => {
+          assert.equal(type, mime, "use offered original format instead of PNG alternative");
+          return new Blob([Uint8Array.from(data)], { type });
+        } }]);
+    } };
+    const clipboardAction = menuPaste();
+    assert.equal(readStarted, true, "clipboard.read starts inside menu user gesture before awaiting queue");
+    await clipboardAction;
+    await menuView.importQueue;
+    assert.equal(menuView.editor.snapshot().length, beforeCount + 1, `${mime}: menu clipboard adds image`);
+    const added = last(menuView.editor.snapshot()).content;
+    assert.deepEqual(Uint8Array.from(added.data), byteCopy);
+    storage();
+    const picker = last(inputs);
+    assert.ok(picker.type === "file" && picker.multiple && picker.pickerOpened);
+    assert.ok(picker.accept.includes(".heic") && picker.accept.includes(".svg"));
+    picker.files = [{ size: data.length, arrayBuffer: async () => Uint8Array.from(data).buffer }];
+    canvasHandlers.get(picker)!.get("change")!({});
+    await menuView.importQueue;
+    assert.ok(picker.removed);
+    assert.equal(menuView.editor.snapshot().length, beforeCount + 2, `${mime}: OS picker adds image`);
+    assert.deepEqual(Uint8Array.from(last(menuView.editor.snapshot()).content.data), byteCopy);
+    menuView.editor.undo(); menuView.editor.redo();
+  }
+  ownerWindow.navigator.clipboard = { read: async () => [{
+    types: ["text/plain"], getType: async () => new Blob([dataUrl], { type: "text/plain" }),
+  }] };
+  await menuPaste();
+  await menuView.importQueue;
+  assert.deepEqual(Uint8Array.from(last(menuView.editor.snapshot()).content.data), svgFixture);
+  const menuCount = menuView.editor.snapshot().length;
+  const oversizedClipboard = new Blob([]);
+  Object.defineProperty(oversizedClipboard, "size", { value: 64 * 1024 * 1024 + 1 });
+  oversizedClipboard.arrayBuffer = async () => assert.fail("oversized clipboard must not be read");
+  for (const item of [
+    { types: ["image/png"], getType: async () => { throw new Error("clipboard image data unavailable"); } },
+    { types: ["image/png"], getType: async () => oversizedClipboard },
+    { types: ["image/tiff"], getType: async () => assert.fail("unsupported clipboard image must not be read") },
+  ]) {
+    ownerWindow.navigator.clipboard = { read: async () => [item] };
+    const errorsBeforePaste: number = loggedErrors.length;
+    await menuPaste();
+    await menuView.importQueue;
+    assert.equal(menuView.editor.snapshot().length, menuCount);
+    assert.equal(loggedErrors.length, errorsBeforePaste + 1, "clipboard item failure is reported instead of ignored");
+  }
+  systemPicker = () => { throw new DOMException("System picker requires a user gesture", "NotAllowedError"); };
+  storage();
+  assert.ok(last(inputs).removed);
+  assert.ok(last(notices).includes("System picker requires a user gesture"));
+  let showPickerCalled = false;
+  systemPicker = () => { showPickerCalled = true; };
+  storage();
+  assert.ok(showPickerCalled, "system file selector is opened synchronously inside menu action");
+  const multiPicker = last(inputs);
+  multiPicker.files = [
+    { size: 4, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer },
+    { size: 64 * 1024 * 1024 + 1, arrayBuffer: async () => assert.fail("oversized file was read") },
+    { size: png.length, arrayBuffer: async () => Uint8Array.from(png).buffer },
+  ];
+  canvasHandlers.get(multiPicker)!.get("change")!({});
+  await menuView.importQueue;
+  assert.equal(menuView.editor.snapshot().length, menuCount + 1,
+    "valid files after failed entries still import through the system picker");
+  menuView.editor.undo();
+  assert.equal(menuView.editor.snapshot().length, menuCount);
+  assert.ok(last(notices).includes("64 MiB"));
+  systemPicker = undefined;
+  storage();
+  const canceledPicker = last(inputs);
+  canvasHandlers.get(canceledPicker)!.get("cancel")!({});
+  assert.ok(canceledPicker.removed);
+  assert.equal(menuView.editor.snapshot().length, menuCount);
+  storage();
+  const oversizedPicker = last(inputs);
+  oversizedPicker.files = [{ size: 64 * 1024 * 1024 + 1,
+    arrayBuffer: async () => assert.fail("oversized file must be rejected before reading") }];
+  canvasHandlers.get(oversizedPicker)!.get("change")!({});
+  await menuView.importQueue;
+  assert.ok(last(notices).includes("64 MiB"));
+  assert.equal(menuView.editor.snapshot().length, menuCount);
+  await new Promise(resolve => setTimeout(resolve, 3200));
+  assert.equal(menuView.editor.dirty, false, "menu imports participate in autosave");
+  const menuSaved = await parsePur(new Uint8Array(liveFiles.get(menuFile.path)!));
+  assert.equal(menuSaved.images.length, menuCount);
+  for (const state of menuView.editor.snapshot()) {
+    const saved = menuSaved.images.find(image => image.id === state.id)!;
+    assert.deepEqual(saved.data, Uint8Array.from(state.content.data));
+  }
+  menuView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("閲覧モードへ")!();
+  menuView.onPaneMenu(new MenuStub(), "more-options");
+  assert.equal(menuDisabled.get("クリップボードから貼り付け"), true);
+  assert.equal(menuDisabled.get("ストレージから画像を読み込む"), true);
+  ownerWindow.navigator.clipboard = { read: async () => assert.fail("read-only menu must not read clipboard") };
+  await menuPaste();
+  menuView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("編集モードへ")!();
+  let resolveClipboard: ((items: []) => void) | undefined;
+  ownerWindow.navigator.clipboard = { read: () => new Promise(resolve => { resolveClipboard = resolve; }) };
+  const pendingMenuPaste = menuPaste();
+  storage();
+  const pendingPicker = last(inputs);
+  await menuView.onClose();
+  assert.ok(pendingPicker.removed, "view close removes pending OS file picker");
+  resolveClipboard!([]);
+  await pendingMenuPaste;
+  assert.ok(last(notices).includes("PURビューが変更されました"));
+  ownerWindow.navigator.clipboard = undefined;
   for (const dispose of livePlugin.disposers) dispose();
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   assert.equal(manifest.isDesktopOnly, false);

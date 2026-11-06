@@ -14,7 +14,9 @@ import { svgDataUrl } from "./svg";
 import { disposeHeicWorker, setHeicFallbackHandler } from "./heic";
 
 const VIEW_TYPE = "lazyref-pur-view";
-const BUILD_ID = "0.12.0";
+const BUILD_ID = "0.13.0";
+const IMAGE_TYPES = ["image/heic", "image/heif", "image/svg+xml", "image/gif", "image/webp",
+  "image/bmp", "image/x-ms-bmp", "image/jpeg", "image/png"];
 const DEFAULT_AUTOSAVE_SECONDS = 3;
 const MIN_AUTOSAVE_SECONDS = 1;
 const MAX_AUTOSAVE_SECONDS = 60;
@@ -153,6 +155,7 @@ class PurView extends FileView {
   private modifyPending = false;
   private backupPath?: string;
   private importQueue: Promise<void> = Promise.resolve();
+  private imagePickerCleanup?: () => void;
 
   constructor(leaf: WorkspaceLeaf, private readonly diagnostics: ViewerDiagnostics, private readonly purPlugin: PurPlugin) {
     super(leaf);
@@ -352,6 +355,8 @@ class PurView extends FileView {
       menu.addItem(item => item.setTitle(title).setDisabled(disabled).onClick(callback));
     action("保存（現在の .pur を上書き）", () => void this.savePurCurrent(), !this.sourceBytes || this.saving);
     action("別名 .pur 保存", () => void this.savePurCopy(), !this.sourceBytes || this.saving);
+    action("クリップボードから貼り付け", () => this.pasteClipboardImage(), !this.canAddImages);
+    action("ストレージから画像を読み込む", () => this.chooseStorageImages(), !this.canAddImages);
     action("保管庫から画像を追加", () => this.chooseVaultImage(), !this.canAddImages);
     action("選択した画像を削除", () => this.renderer?.removeSelected(), !this.renderer?.canTransformSelected);
     action("元に戻す", () => this.renderer?.undo(), !this.editor?.canUndo);
@@ -387,6 +392,86 @@ class PurView extends FileView {
         if (file.size > MAX_FILE_BYTES) throw new Error("64 MiBを超える画像は追加できません");
         return new Uint8Array(await file.arrayBuffer());
       }, client);
+    }
+  }
+  private async pasteClipboardImage(): Promise<void> {
+    if (!this.canAddImages) return;
+    const loadId = this.loadId;
+    try {
+      const clipboard = this.contentEl.ownerDocument.defaultView?.navigator.clipboard;
+      if (!clipboard || typeof clipboard.read !== "function")
+        throw new Error("この端末では画像のクリップボード読取APIを利用できません。ストレージから画像を選択してください");
+      // Start within the menu click, before any queue or other asynchronous work.
+      const items = await clipboard.read();
+      if (loadId !== this.loadId || !this.canAddImages)
+        throw new Error("クリップボードの読取中にPURビューが変更されました");
+      let queued = false;
+      for (const item of items) {
+        const type = IMAGE_TYPES.find(type => item.types.includes(type));
+        if (type) {
+          queued = true;
+          this.queueImageRead(async () => {
+            const blob = await item.getType(type);
+            if (blob.size > MAX_FILE_BYTES) throw new Error("64 MiBを超える画像は追加できません");
+            return new Uint8Array(await blob.arrayBuffer());
+          });
+        } else if (item.types.some(type => type.startsWith("image/"))) {
+          queued = true;
+          this.queueImageRead(async () => {
+            throw new Error("クリップボードの画像形式は未対応です。PNG、JPEG、GIF、WebP、BMP、SVG、HEICを選択してください");
+          });
+        } else if (item.types.includes("text/plain")) {
+          const text = await item.getType("text/plain");
+          if (text.size > MAX_FILE_BYTES) throw new Error("64 MiBを超えるクリップボードデータは追加できません");
+          const value = await text.text();
+          if (loadId !== this.loadId || !this.canAddImages)
+            throw new Error("クリップボードの読取中にPURビューが変更されました");
+          if (/^data:image\/svg\+xml[;,]/i.test(value.trim())) {
+            queued = true;
+            this.queueImageRead(async () => svgDataUrl(value));
+          }
+        }
+      }
+      if (!queued) throw new Error("クリップボードに対応画像またはSVGデータURLがありません");
+    } catch (error) {
+      const denied = error instanceof DOMException && ["NotAllowedError", "SecurityError"].includes(error.name);
+      this.reportFailure("クリップボード貼り付け", denied
+        ? new Error("端末がクリップボードの読取を拒否しました。権限とアプリのフォーカスを確認し、メニューから再実行してください")
+        : error);
+    }
+  }
+  private chooseStorageImages(): void {
+    if (!this.canAddImages) return;
+    this.imagePickerCleanup?.();
+    const loadId = this.loadId;
+    const input = this.contentEl.createEl("input");
+    input.type = "file";
+    input.accept = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif",
+      ...IMAGE_TYPES].join(",");
+    input.multiple = true;
+    input.hidden = true;
+    const cleanup = () => {
+      input.remove();
+      if (this.imagePickerCleanup === cleanup) this.imagePickerCleanup = undefined;
+    };
+    this.imagePickerCleanup = cleanup;
+    input.addEventListener("cancel", cleanup, { once: true });
+    input.addEventListener("change", () => {
+      const files = Array.from(input.files ?? []);
+      cleanup();
+      if (loadId !== this.loadId || !this.canAddImages) {
+        this.reportFailure("ストレージ画像選択", new Error("画像の選択中にPURビューが変更されました"));
+        return;
+      }
+      this.queueImageFiles(files);
+    }, { once: true });
+    try {
+      // The host WebView opens the OS file picker; no desktop-only path APIs.
+      if (typeof input.showPicker === "function") input.showPicker();
+      else input.click();
+    } catch (error) {
+      cleanup();
+      this.reportFailure("ストレージ画像選択", error);
     }
   }
   private chooseVaultImage(): void {
@@ -867,6 +952,7 @@ class PurView extends FileView {
   }
 
   private clearBoard(reason: string): void {
+    this.imagePickerCleanup?.();
     this.trace(`clearBoard: ${reason}; renderer=${Boolean(this.renderer)}; loading=${Boolean(this.loading)}; dirty=${Boolean(this.editor?.dirty)}`);
     const caller = new Error().stack?.split("\n").slice(2, 6).map(line => line.trim()).join(" <- ");
     if (caller) this.trace(`clearBoard caller: ${caller}`);
