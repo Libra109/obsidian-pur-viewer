@@ -82,6 +82,9 @@ export function boardFromDatabase(db: Database): Board {
     "未対応のデータベース世代です");
   const warnings = new Set<string>();
   const board: Board = { version: "2.1", images: [], warnings: [] };
+  board.maxItemId = integer(rows(db, `SELECT COALESCE(MAX(id),-1) AS id FROM (
+    SELECT id FROM items UNION ALL SELECT id FROM items_images UNION ALL SELECT id FROM items_groups
+    UNION ALL SELECT id FROM items_notes UNION ALL SELECT id FROM items_drawings)`)[0].id, "最大項目ID");
   const rootZ = rows(db, `SELECT id,z,CAST(sort_order AS BLOB) AS sort_order,
     typeof(sort_order) AS sort_order_type FROM items WHERE parent=-1 OR parent IS NULL`);
   board.maxRootZ = rootZ.reduce((max, row) => Math.max(max, number(row.z, "items.z", 0)), -Infinity);
