@@ -1,4 +1,7 @@
 import { check } from "./binary";
+import { looksLikeSvg } from "./svg";
+import { heicMime } from "./heic";
+import type { SqlValue } from "sql.js";
 
 /** Canvas/CSS order: x' = a*x + c*y + e, y' = b*x + d*y + f. */
 export type Matrix = [number, number, number, number, number, number];
@@ -7,6 +10,10 @@ export interface Point { x: number; y: number }
 export interface Clip {
   elements: { type: number; x: number; y: number }[];
   fillRule: CanvasFillRule;
+}
+export interface StoredRow {
+  values: Record<string, SqlValue>;
+  textColumns: string[];
 }
 export interface BoardImage {
   id: number;
@@ -19,6 +26,7 @@ export interface BoardImage {
   clip?: Clip;
   opacity: number;
   z: number;
+  stored?: { item: StoredRow; imageItem: StoredRow; source: StoredRow };
 }
 export interface Board {
   version: string;
@@ -76,5 +84,7 @@ export function imageMime(data: Uint8Array): string | undefined {
   if (new TextDecoder().decode(data.subarray(0, 6)).match(/^GIF8[79]a$/)) return "image/gif";
   if (new TextDecoder().decode(data.subarray(0, 4)) === "RIFF" &&
       new TextDecoder().decode(data.subarray(8, 12)) === "WEBP") return "image/webp";
-  return undefined;
+  if (data[0] === 66 && data[1] === 77) return "image/bmp";
+  if (looksLikeSvg(data)) return "image/svg+xml";
+  return heicMime(data);
 }

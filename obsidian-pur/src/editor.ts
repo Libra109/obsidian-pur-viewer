@@ -82,7 +82,7 @@ export class BoardEditor {
   }
   add(content: Omit<BoardImage, "id" | "z">): BoardImage {
     check(Number.isSafeInteger(this.nextId), "画像項目IDが整数の上限に達しています");
-    const image: BoardImage = { ...content, id: this.nextId++, z: this.nextFrontZ() };
+    const image: BoardImage = { ...content, stored: undefined, id: this.nextId++, z: this.nextFrontZ() };
     this.known.set(image.id, image);
     this.tieOrder.set(image.id, this.tieOrder.size);
     this.images.push(image);

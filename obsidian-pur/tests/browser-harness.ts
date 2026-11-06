@@ -1,10 +1,10 @@
-import { BoardImage, boardBounds, multiply, transform } from "../src/board";
-import { parsePur } from "../src/parser";
+import { BoardImage, boardBounds, Matrix, multiply, transform } from "../src/board";
+import { extractDatabase, parsePur, sqlite } from "../src/parser";
 import { BoardRenderer, decodeImages, drawBoard } from "../src/renderer";
 import { Camera } from "../src/camera";
 import { formatLoadMetrics, loadMetrics } from "../src/metrics";
 import { BoardEditor } from "../src/editor";
-import { writePurCopy } from "../src/writer";
+import { wrapDatabase, writePurCopy } from "../src/writer";
 import { drawGrid, gridLines } from "../src/grid";
 import {
   flipItem, imageCenter, imageHandles, rotateMatrixAboutPoint, rotationHandles,
@@ -13,6 +13,14 @@ import { BackupRecord, BackupStore, PurBackups } from "../src/backups";
 import { overwriteVerified } from "../src/overwrite";
 import { sameBytes } from "../src/save-copy";
 import { IdleAutosave } from "../src/autosave";
+import { decodeRaster, importImage } from "../src/image-import";
+import { animatedWebp, bmpFixture, firstFrame, gifFixture } from "./raster-fixtures";
+import SparkMD5 from "spark-md5";
+import { svgDataUrl, svgDimensions, validateSvg } from "../src/svg";
+import { svgFixture } from "./svg-fixtures";
+import { disposeHeicWorker, heicPixels, setHeicFallbackHandler } from "../src/heic";
+import { codecPixels } from "../src/heic-codec";
+import createHeif from "libheif-js/libheif/libheif.js";
 
 async function run(): Promise<void> {
   const results: string[] = [];
@@ -34,6 +42,346 @@ async function run(): Promise<void> {
     assert(saves === 1, "実ブラウザー既定タイマーで編集通知から自動保存を予約");
   }
   const nextFrame = () => new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+  {
+    const bytes = new Uint8Array(await (await fetch("/fixture/heic")).arrayBuffer());
+    const source = new Uint8Array(await (await fetch("/fixture/v2")).arrayBuffer());
+    const signal = new AbortController().signal;
+    const nativeWorker = window.Worker;
+    let createdWorkers = 0, terminatedWorkers = 0;
+    let cancelAfterReady: AbortController | undefined;
+    const fallbacks: string[] = [];
+    window.Worker = class extends nativeWorker {
+      constructor(url: string | URL, options?: WorkerOptions) {
+        super(url, options);
+        createdWorkers++;
+        this.addEventListener("message", event => {
+          if (event.data.kind === "ready" && cancelAfterReady) {
+            const controller = cancelAfterReady;
+            cancelAfterReady = undefined;
+            setTimeout(() => controller.abort(), 10);
+          }
+        });
+      }
+      terminate(): void { terminatedWorkers++; super.terminate(); }
+    };
+    setHeicFallbackHandler(message => fallbacks.push(message));
+    const rgba = await heicPixels(bytes, signal);
+    assert(rgba.width === 1280 && rgba.height === 854, "実HEICコレクションの主画像のみを展開");
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(rgba.data))))
+      .map(v => v.toString(16).padStart(2, "0")).join("");
+    assert(hash === "7f8f77c3e33f64338ebea81ce0102de5a0cf132061bef3176cad0373d7bada3b",
+      "HEIC WASM Workerの画素が固定期待値と一致");
+    assert(createdWorkers === 1 && terminatedWorkers === 1 && fallbacks.length === 0,
+      "WASM Workerを実際に起動し処理終了後に破棄");
+    const legacy = await codecPixels(bytes, signal, createHeif());
+    assert(sameBytes(new Uint8Array(rgba.data), new Uint8Array(legacy.data)),
+      "WASM Workerと従来JSデコーダーの全画素が一致");
+    const original = bytes.slice();
+    const parallel = await Promise.all([heicPixels(bytes, signal), heicPixels(bytes, signal)]);
+    assert(parallel.every(image => sameBytes(new Uint8Array(image.data), new Uint8Array(rgba.data))),
+      "同時HEIC要求を単一Worker内で直列処理し応答を対応付け");
+    const aborted = new AbortController();
+    cancelAfterReady = aborted;
+    const canceled = heicPixels(bytes, aborted.signal).then(() => false, error => error.name === "AbortError");
+    const survivor = heicPixels(bytes, signal);
+    assert(await canceled && (await survivor).width === 1280,
+      "HEIC中断はWorkerを破棄し他要求は新Workerで完了");
+    const closing = heicPixels(bytes, signal).then(() => false, error => error.name === "AbortError");
+    disposeHeicWorker();
+    assert(await closing && createdWorkers === terminatedWorkers,
+      "終了時に保留HEICを中断し全Workerを破棄");
+    assert(sameBytes(bytes, original), "Worker入力の元バッファーは転送で失われず全バイト保持");
+    const imported = await importImage(bytes, { x: 0, y: 0 }, 0, signal);
+    try {
+      const board = await parsePur(source);
+      const editor = new BoardEditor(board.images);
+      const added = editor.add(imported.content);
+      const output = await writePurCopy(source, editor.snapshot());
+      const image = (await parsePur(output)).images.find(i => i.id === added.id)!;
+      assert(image.mime === "image/heic" && sameBytes(image.data, bytes), "HEIC保存後の元バイトと形式が一致");
+      const decoded = await decodeImages([image], signal);
+      try {
+        const canvas = document.createElement("canvas"); canvas.width = 1280; canvas.height = 854;
+        const context = canvas.getContext("2d")!;
+        context.drawImage(decoded[0].bitmap, 0, 0);
+        const saved = context.getImageData(0, 0, 1280, 854).data;
+        assert(saved.every((v, i) => Math.abs(v - rgba.data[i]) <= 1), "HEIC保存再解析後の描画画素が一致");
+        canvas.width = 0; canvas.height = 0;
+      } finally { decoded[0].bitmap.close(); }
+      editor.acceptSaved(editor.snapshot()); editor.removeSelected();
+      const deleted = await writePurCopy(output, editor.snapshot(), editor.deletedIds);
+      editor.acceptSaved(editor.snapshot()); editor.undo();
+      const restored = await parsePur(await writePurCopy(deleted, editor.snapshot()));
+      assert(sameBytes(restored.images.find(i => i.id === added.id)!.data, bytes), "HEIC削除保存後Undoも全バイトを保持");
+    } finally { imported.bitmap.close(); }
+    let rejected = false;
+    try { await importImage(bytes.subarray(0, 28), { x: 0, y: 0 }, 0, signal); } catch { rejected = true; }
+    assert(rejected, "破損HEICを空画像に置き換えず拒否");
+    assert(fallbacks.length === 0, "破損HEICは従来方式へ切り替えずエラー");
+    const limits = await heicPixels(bytes, signal, { maxPixels: 1 }).then(() => false,
+      error => error.message.includes("80メガピクセル"));
+    const mismatch = await heicPixels(bytes, signal, { width: 1, height: 1 }).then(() => false,
+      error => error.message.includes("保存寸法"));
+    assert(limits && mismatch, "WASM Workerは集計予算と保存寸法を展開前に検証");
+    assert(createdWorkers === terminatedWorkers, "成功と破損と制限エラーでもWorkerを残さない");
+    window.Worker = nativeWorker;
+    setHeicFallbackHandler();
+    for (const [id, policy] of [
+      ["worker-blocked", "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; worker-src 'none'"],
+      ["wasm-blocked", "script-src 'self' 'unsafe-inline'; worker-src blob:"],
+    ]) {
+      const frame = document.createElement("iframe");
+      frame.hidden = true;
+      document.body.appendChild(frame);
+      try {
+        const result = await new Promise<{ ok: boolean; notices: number; hash: string; error?: string }>(
+          (resolve, reject) => {
+            const receive = (event: MessageEvent) => {
+              if (event.source !== frame.contentWindow || event.data.id !== id) return;
+              clearTimeout(timeout);
+              window.removeEventListener("message", receive);
+              resolve(event.data);
+            };
+            const timeout = setTimeout(() => {
+              window.removeEventListener("message", receive);
+              reject(new Error(`${id}: fallback test timed out`));
+            }, 20000);
+            window.addEventListener("message", receive);
+            frame.srcdoc = `<meta http-equiv="Content-Security-Policy" content="${policy}">
+              <script src="/heic-api.js"></script><script>
+              (async()=>{let notices=0;Heic.setHeicFallbackHandler(()=>notices++);
+              const b=new Uint8Array(await(await fetch('/fixture/heic')).arrayBuffer());
+              const p=await Heic.heicPixels(b,new AbortController().signal);
+              const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',p.data)),
+                v=>v.toString(16).padStart(2,'0')).join('');
+              parent.postMessage({id:'${id}',ok:true,notices,hash},'*');
+              })().catch(e=>parent.postMessage({id:'${id}',ok:false,error:e.message},'*'));
+              </script>`;
+          });
+        assert(result.ok && result.notices === 1 &&
+          result.hash === "7f8f77c3e33f64338ebea81ce0102de5a0cf132061bef3176cad0373d7bada3b",
+        `${id}: 実CSP制限下で通知して従来方式へ切り替え画素を保持 (${result.error ?? "ok"})`);
+      } finally { frame.remove(); }
+    }
+  }
+  {
+    const source = new Uint8Array(await (await fetch("/fixture/v2")).arrayBuffer());
+    const bytes = svgDataUrl(`data:image/svg+xml;base64,${btoa(new TextDecoder().decode(svgFixture))}`);
+    assert(sameBytes(bytes, svgFixture), "SVGデータURLの全バイトを保持");
+    const imported = await importImage(bytes, { x: 0, y: 0 }, 0, new AbortController().signal);
+    const canvas = document.createElement("canvas");
+    canvas.width = 3; canvas.height = 2;
+    const ctx = canvas.getContext("2d")!;
+    const pixels = (bitmap: ImageBitmap) => {
+      ctx.clearRect(0, 0, 3, 2); ctx.drawImage(bitmap, 0, 0);
+      return ctx.getImageData(0, 0, 3, 2).data.slice();
+    };
+    try {
+      const expected = pixels(imported.bitmap);
+      assert(expected[0] === 255 && expected[1] === 0 && expected[3] === 255 && expected[11] === 0,
+        "SVGのパス、内部グラデーション、透過を描画");
+      const board = await parsePur(source);
+      const editor = new BoardEditor(board.images);
+      const image = editor.add(imported.content);
+      const output = await writePurCopy(source, editor.snapshot());
+      const reopened = await parsePur(output);
+      const added = reopened.images.find(i => i.id === image.id)!;
+      assert(added.mime === "image/svg+xml" && sameBytes(added.data, svgFixture),
+        "SVG保存後の元バイトと形式が一致");
+      const decoded = await decodeImages([added], new AbortController().signal);
+      try { assert(pixels(decoded[0].bitmap).every((v, i) => v === expected[i]), "既存PUR内SVGの再描画が一致"); }
+      finally { decoded[0].bitmap.close(); }
+      editor.acceptSaved(editor.snapshot());
+      const moved = [...image.item] as Matrix; moved[4] += 10;
+      editor.transformItem(image.id, moved);
+      const preserved = await parsePur(await writePurCopy(output, editor.snapshot()));
+      assert(sameBytes(preserved.images.find(i => i.id === image.id)!.data, svgFixture),
+        "SVG配置変更後も元バイトを保持");
+      editor.undo(); editor.removeSelected();
+      const deleted = await writePurCopy(output, editor.snapshot(), editor.deletedIds);
+      editor.acceptSaved(editor.snapshot()); editor.undo();
+      const restored = await parsePur(await writePurCopy(deleted, editor.snapshot()));
+      assert(sameBytes(restored.images.find(i => i.id === image.id)!.data, svgFixture),
+        "SVG削除保存後Undoも元バイトを保持");
+    } finally { imported.bitmap.close(); }
+    const wrap = (body: string, attrs = "") => new TextEncoder().encode(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="3" height="2" ${attrs}>${body}</svg>`);
+    for (const bytes of [
+      wrap('<script>alert(1)</script>'), wrap('<foreignObject/>'),
+      wrap('<image href="https://example.invalid/a.png"/>'),
+      wrap('<path fill="url(https://example.invalid/a)"/>'),
+      wrap('<style>@import "https://example.invalid/a";</style>'),
+      wrap('<path style="fill:red"/>'), wrap('<animate attributeName="width"/>'),
+      wrap('<use id="a" href="#a"/>'), wrap('<path/>', 'onload="alert(1)"'),
+      wrap('<path/>', 'xml:base="https://example.invalid/"'),
+      new TextEncoder().encode('<!DOCTYPE svg><svg width="3" height="2"/>'),
+      wrap('<g>'), wrap('<use href="#missing"/>'),
+    ]) {
+      let rejected = false;
+      try { validateSvg(bytes); } catch { rejected = true; }
+      assert(rejected, "SVGの能動コンテンツ、外部参照、再帰、壊れたXMLを拒否");
+    }
+    const viewBox = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 49 49"><circle cx="24" cy="24" r="20" fill="orange"/></svg>');
+    assert(svgDimensions(viewBox).width === 49, "SVGのviewBox寸法を採用");
+    const bitmap = await decodeRaster(viewBox, "image/svg+xml", new AbortController().signal);
+    try { assert(bitmap.width === 49 && bitmap.height === 49, "viewBoxのみのSVGを指定寸法で描画"); }
+    finally { bitmap.close(); }
+  }
+  {
+    const source = new Uint8Array(await (await fetch("/fixture/v2")).arrayBuffer());
+    const canvas = document.createElement("canvas");
+    canvas.width = 3; canvas.height = 2;
+    const context = canvas.getContext("2d")!;
+    const pixels = new Uint8ClampedArray(firstFrame.flat());
+    pixels[4 * 4 + 3] = 128;
+    context.putImageData(new ImageData(pixels, 3, 2), 0, 0);
+    const webp = () => new Promise<Blob>((resolve, reject) => canvas.toBlob(blob => {
+      if (blob?.type === "image/webp") resolve(blob);
+      else reject(new Error("テスト端末はWebPの符号化に対応していません"));
+    }, "image/webp", 1));
+    const firstWebp = new Uint8Array(await (await webp()).arrayBuffer());
+    context.fillStyle = "#0000ff"; context.fillRect(0, 0, 3, 2);
+    const secondWebp = new Uint8Array(await (await webp()).arrayBuffer());
+    const fixtures = [
+      { name: "static GIF", mime: "image/gif", bytes: gifFixture() },
+      { name: "animated GIF", mime: "image/gif", bytes: gifFixture(true) },
+      { name: "static WebP", mime: "image/webp", bytes: firstWebp },
+      { name: "animated WebP", mime: "image/webp", bytes: animatedWebp([firstWebp, secondWebp]) },
+      { name: "bottom-up BMP", mime: "image/bmp", bytes: bmpFixture() },
+      { name: "top-down BMP", mime: "image/bmp", bytes: bmpFixture(true) },
+      { name: "alpha BMP", mime: "image/bmp", bytes: bmpFixture(false, true) },
+    ];
+    const readPixels = (bitmap: ImageBitmap) => {
+      context.clearRect(0, 0, 3, 2); context.drawImage(bitmap, 0, 0);
+      return context.getImageData(0, 0, 3, 2).data;
+    };
+    const firstWebpBitmap = await decodeRaster(firstWebp, "image/webp", new AbortController().signal);
+    const webpPixels = readPixels(firstWebpBitmap).slice();
+    firstWebpBitmap.close();
+    for (const fixture of fixtures) {
+      const expected = fixture.mime === "image/webp" ? webpPixels : Uint8ClampedArray.from(
+        firstFrame.flatMap((pixel, i) => fixture.mime === "image/bmp" && fixture.name !== "alpha BMP" &&
+          i === 0 ? [0, 0, 0, 255] : fixture.name === "alpha BMP" && i === 4 ? [0, 0, 255, 128] : pixel));
+      const imported = await importImage(fixture.bytes, { x: 5, y: 7 }, 0, new AbortController().signal);
+      try {
+        assert(imported.content.mime === fixture.mime && imported.content.width === 3 &&
+          imported.content.height === 2 && sameBytes(imported.content.data, fixture.bytes),
+          `${fixture.name}: 元形式と全バイトを保持して先頭フレームだけ展開`);
+        assert(readPixels(imported.bitmap).every((value, i) => Math.abs(value - expected[i]) <= 1),
+          `${fixture.name}: 先頭フレームの色、上下方向、透過を保持`);
+        const board = await parsePur(source);
+        const editor = new BoardEditor(board.images);
+        editor.add(imported.content);
+        const output = await writePurCopy(source, editor.snapshot());
+        const restored = await parsePur(output);
+        const added = restored.images[restored.images.length - 1];
+        assert(added.mime === fixture.mime && sameBytes(added.data, fixture.bytes),
+          `${fixture.name}: 保存と再解析後の形式と全バイトが完全一致`);
+        const decoded = await decodeImages([added], new AbortController().signal);
+        try {
+          assert(readPixels(decoded[0].bitmap).every((value, i) => Math.abs(value - expected[i]) <= 1),
+            `${fixture.name}: 元形式での保存と再解析後も先頭フレームと透過が一致`);
+        } finally { decoded[0].bitmap.close(); }
+        editor.undo(); assert(editor.images.length === 1 && !editor.dirty, `${fixture.name}: 追加Undo`);
+        editor.redo(); assert(editor.images.length === 2 && editor.dirty, `${fixture.name}: 追加Redo`);
+        const redone = await parsePur(await writePurCopy(source, editor.snapshot()));
+        assert(sameBytes(redone.images[redone.images.length - 1].data, fixture.bytes),
+          `${fixture.name}: Undo/Redo後の保存も全バイトが完全一致`);
+        const SQL = await sqlite();
+        const db = new SQL.Database(extractDatabase(source));
+        try {
+          const checksum = new SparkMD5.ArrayBuffer();
+          checksum.append(Uint8Array.from(fixture.bytes).buffer);
+          db.run("UPDATE images SET width=3,height=2,data=?,format=?,checksum=?",
+            [fixture.bytes, fixture.mime.slice(6).toUpperCase(), checksum.end()]);
+          if (fixture.mime === "image/gif")
+            db.run("UPDATE items_images SET playback_state=2,playback_frame=999");
+          const existingSource = wrapDatabase(source, db.export());
+          const existing = await parsePur(existingSource);
+          const existingDecoded = await decodeImages(existing.images, new AbortController().signal);
+          try {
+            assert(readPixels(existingDecoded[0].bitmap).every((value, i) => Math.abs(value - expected[i]) <= 1),
+              `${fixture.name}: 既存PURの先頭フレームも静止表示`);
+          } finally { existingDecoded[0].bitmap.close(); }
+          const existingEditor = new BoardEditor(existing.images);
+          const moved = [...existing.images[0].item] as Matrix;
+          moved[4] += 10;
+          existingEditor.transformItem(existing.images[0].id, moved);
+          const preserved = await writePurCopy(existingSource, existingEditor.snapshot());
+          const saved = new SQL.Database(extractDatabase(preserved));
+          try {
+            assert(JSON.stringify(saved.exec("SELECT typeof(data),hex(data),format,checksum FROM images")) ===
+              JSON.stringify(db.exec("SELECT typeof(data),hex(data),format,checksum FROM images")),
+            `${fixture.name}: 既存PURの配置変更後も画像データと形式とチェックサムを無変換で保持`);
+            assert(JSON.stringify(saved.exec("SELECT flags,playback_state,playback_frame,playback_speed FROM items_images")) ===
+              JSON.stringify(db.exec("SELECT flags,playback_state,playback_frame,playback_speed FROM items_images")),
+            `${fixture.name}: 既存PURの再生属性を保持`);
+          } finally { saved.close(); }
+        } finally { db.close(); }
+      } finally { imported.bitmap.close(); }
+    }
+  }
+  {
+    const source = new Uint8Array(await (await fetch("/fixture/v2")).arrayBuffer());
+    const board = await parsePur(source);
+    const decoded = await decodeImages(board.images, new AbortController().signal);
+    const editor = new BoardEditor(board.images);
+    const canvas = document.createElement("canvas");
+    canvas.style.width = "200px"; canvas.style.height = "150px";
+    document.body.append(canvas);
+    const live = new BoardRenderer(canvas, decoded, boardBounds(board.images), editor);
+    live.setEditMode(true);
+    live.zoom(8);
+    const sample = () => {
+      const world = { x: 500, y: 375 };
+      const x = (world.x * live.camera.scale + live.camera.x) * canvas.width / canvas.clientWidth;
+      const y = (world.y * live.camera.scale + live.camera.y) * canvas.height / canvas.clientHeight;
+      return canvas.getContext("2d")!.getImageData(Math.floor(x), Math.floor(y), 1, 1).data;
+    };
+    await nextFrame();
+    const originalPixel = Array.from(sample());
+    const imageCanvas = document.createElement("canvas");
+    imageCanvas.width = 64; imageCanvas.height = 48;
+    const imageContext = imageCanvas.getContext("2d")!;
+    imageContext.fillStyle = "#00ff00";
+    imageContext.fillRect(0, 0, 64, 48);
+    try {
+      for (const mime of ["image/png", "image/jpeg"]) {
+        const blob = await new Promise<Blob>((resolve, reject) => imageCanvas.toBlob(value => {
+          if (value) resolve(value); else reject(new Error("画像の符号化に失敗しました"));
+        }, mime));
+        const imported = await importImage(new Uint8Array(await blob.arrayBuffer()),
+          { x: 500, y: 375 }, live.retainedPixels, new AbortController().signal);
+        live.addImage(imported.content, imported.bitmap);
+        assert(sample()[1] > 200 && sample()[0] < 30, `${mime}: 新規画像を実Canvasの最前面に描画`);
+        const snapshot = editor.snapshot();
+        const addedId = editor.selectedId!;
+        const output = await writePurCopy(source, snapshot, editor.deletedIds);
+        const reopened = await parsePur(output);
+        const added = reopened.images.find(image => image.id === addedId)!;
+        assert(sameBytes(added.data, new Uint8Array(await blob.arrayBuffer())),
+          `${mime}: 保存と再解析後の全バイトが完全一致`);
+        assert(added.mime === mime && added.width === 64 && added.height === 48,
+          `${mime}: 実ブラウザーで符号化した画像を2.1へ追加保存して再解析`);
+        const reopenedImages = await decodeImages(reopened.images, new AbortController().signal);
+        assert(reopenedImages.length === snapshot.length, `${mime}: 保存した追加画像を再展開`);
+        for (const { bitmap } of reopenedImages) bitmap.close();
+        live.removeSelected();
+        assert(editor.images.length === 1 && sample().every((value, i) => value === originalPixel[i]),
+          `${mime}: 削除画像を描画対象から外す`);
+        const deleted = await writePurCopy(output, editor.snapshot(), [addedId]);
+        assert((await parsePur(deleted)).images.length === 1, `${mime}: 保存済みの追加画像を削除して再解析`);
+        live.undo();
+        await nextFrame();
+        assert(sample()[1] > 200 && sample()[0] < 30, `${mime}: Undoで画像と描画を復元`);
+        live.discardEdits();
+        await nextFrame();
+        assert(editor.images.length === 1 && !editor.dirty &&
+          sample().every((value, i) => value === originalPixel[i]),
+          `${mime}: 変更破棄で元の画像だけに戻す`);
+      }
+    } finally { live.dispose(); canvas.remove(); }
+  }
   const host = document.createElement("div");
   host.className = "workspace-leaf-content";
   const pane = document.createElement("div");
@@ -51,7 +399,7 @@ async function run(): Promise<void> {
     button.textContent = text;
     toolbar.append(button);
   }
-  for (const text of ["ビルド 0.8.4 / 通常保存は現在のファイルへ上書き", "編集モード"]) {
+  for (const text of ["ビルド 0.11.0 / 通常保存は現在のファイルへ上書き", "編集モード"]) {
     const span = document.createElement("span");
     span.textContent = text;
     toolbar.append(span);

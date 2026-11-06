@@ -8,6 +8,11 @@ import { copyPath, saveVerifiedCopy } from "../src/save-copy";
 import type { Matrix } from "../src/board";
 import { BoardEditor } from "../src/editor";
 import { flipItem, imageCenter, rotateMatrixAboutPoint } from "../src/handles";
+import { decodeClip, decodeOrder, decodeTransform } from "../src/codecs";
+import { Reader } from "../src/binary";
+import { animatedWebp, bmpFixture, gifFixture } from "./raster-fixtures";
+import { svgFixture } from "./svg-fixtures";
+import SparkMD5 from "spark-md5";
 
 const original = new Uint8Array(readFileSync(new URL(
   "../../crates/purcore/tests/fixtures/S1_redbar-new.pur", import.meta.url)));
@@ -215,4 +220,182 @@ test("save-as validates names, refuses conflicts and external edits, and verifie
   await assert.rejects(saveVerifiedCopy(changedDuringWrite, original, "other.pur", output, () => current), /編集状態.*残っている/);
   assert.deepEqual(original, new Uint8Array(readFileSync(new URL(
     "../../crates/purcore/tests/fixtures/S1_redbar-new.pur", import.meta.url))));
+});
+
+test("added images use the real 2.1 schema, TEXT variants, checksum and collision-free IDs", async () => {
+  const SQL = await sqlite();
+  const db = new SQL.Database(extractDatabase(original));
+  try {
+    db.run(`INSERT INTO items(id,parent,z,name) VALUES(900,-1,100,'hidden');
+      INSERT INTO items_notes(id,text) VALUES(900,'keep');`);
+    const source = wrapDatabase(original, db.export());
+    const board = await parsePur(source);
+    const editor = new BoardEditor(board.images, () => {}, board.maxHiddenRootZ,
+      board.frontmostRootId, board.maxItemId);
+    const added = editor.add({
+      ...board.images[0], item: [1, 0, 0, 1, 200, 300], image: [1, 0, 0, 1, -32, -24],
+    });
+    assert.equal(added.id, 901);
+    assert.equal(added.z, 101);
+    const output = await writePurCopy(source, editor.snapshot(), editor.deletedIds);
+    const reopened = await parsePur(output);
+    assert.equal(reopened.images.length, 2);
+    assert.equal(reopened.images[reopened.images.length - 1].id, added.id);
+    const saved = new SQL.Database(extractDatabase(output));
+    try {
+      assert.deepEqual(saved.exec("SELECT id,text FROM items_notes"), db.exec("SELECT id,text FROM items_notes"));
+      assert.equal(saved.exec("PRAGMA integrity_check")[0].values[0][0], "ok");
+      assert.deepEqual(saved.exec("PRAGMA foreign_key_check"), []);
+      assert.deepEqual(saved.exec(`SELECT width,height,checksum,format,source_type,source,origin
+        FROM images WHERE id=1`)[0].values[0],
+      [64, 48, "3f97a27e8cbfd743b3d6e3a675290a0b", "PNG", 1, null, null]);
+      const textVariant = (table: string, column: string) => {
+        const row = saved.exec(`SELECT typeof(${column}), CAST(${column} AS BLOB)
+          FROM ${table} WHERE id=${added.id}`)[0].values[0];
+        assert.equal(row[0], "text");
+        return new TextDecoder("utf-8", { fatal: true }).decode(row[1] as Uint8Array);
+      };
+      assert.deepEqual(decodeTransform(textVariant("items", "transform")), added.item);
+      assert.deepEqual(decodeTransform(textVariant("items_images", "image_transform")), added.image);
+      assert.deepEqual(decodeClip(textVariant("items_images", "image_bounds")), added.clip);
+      assert.deepEqual(decodeOrder(textVariant("items", "sort_order")), { numerator: 902n, denominator: 1n });
+      assert.deepEqual(saved.exec(`SELECT parent,opacity,locked,comment FROM items WHERE id=901`)[0].values[0],
+        [-1, 1, 0, null]);
+      assert.deepEqual(saved.exec(`SELECT image,flags,playback_state,playback_frame,playback_speed
+        FROM items_images WHERE id=901`)[0].values[0], [1, 1, 0, 0, 1]);
+    } finally { saved.close(); }
+    editor.acceptSaved(editor.snapshot());
+    editor.undo();
+    const withoutAdded = await writePurCopy(output, editor.snapshot(), editor.deletedIds);
+    assert.equal((await parsePur(withoutAdded)).images.length, 1);
+    editor.acceptSaved(editor.snapshot());
+    editor.redo();
+    const resurrected = await writePurCopy(withoutAdded, editor.snapshot(), editor.deletedIds);
+    const restoredImages = (await parsePur(resurrected)).images;
+    assert.deepEqual(restoredImages[restoredImages.length - 1].item, added.item);
+    assert.deepEqual(restoredImages[restoredImages.length - 1].data, added.data);
+  } finally { db.close(); }
+});
+
+test("deletion removes only supported item rows and releases data only after the last reference", async () => {
+  const SQL = await sqlite();
+  const db = new SQL.Database(extractDatabase(original));
+  try {
+    db.run(`INSERT INTO items(id,parent,transform,opacity,z,sort_order)
+      SELECT 1,parent,transform,opacity,z,sort_order FROM items;
+      INSERT INTO items_images(id,image,image_transform,image_bounds,flags,playback_state,playback_frame)
+      SELECT 1,image,image_transform,image_bounds,flags,playback_state,playback_frame FROM items_images;
+      INSERT INTO items(id,parent,name) VALUES(900,-1,'note');
+      INSERT INTO items_notes(id,text) VALUES(900,'keep');`);
+    const source = wrapDatabase(original, db.export());
+    const board = await parsePur(source), editor = new BoardEditor(board.images);
+    editor.select(0); editor.removeSelected();
+    const output = await writePurCopy(source, editor.snapshot(), editor.deletedIds);
+    const saved = new SQL.Database(extractDatabase(output));
+    try {
+      assert.equal(saved.exec("SELECT COUNT(*) FROM images")[0].values[0][0], 1);
+      assert.deepEqual(saved.exec("SELECT id FROM items ORDER BY id")[0].values, [[1], [900]]);
+      assert.deepEqual(saved.exec("SELECT id,text FROM items_notes"), db.exec("SELECT id,text FROM items_notes"));
+    } finally { saved.close(); }
+    editor.acceptSaved(editor.snapshot());
+    editor.select(1); editor.removeSelected();
+    const empty = await writePurCopy(output, editor.snapshot(), editor.deletedIds);
+    assert.deepEqual((await parsePur(empty)).images, []);
+    const emptyDb = new SQL.Database(extractDatabase(empty));
+    try {
+      assert.equal(emptyDb.exec("SELECT COUNT(*) FROM images")[0].values[0][0], 0);
+      assert.deepEqual(emptyDb.exec("SELECT id FROM items")[0].values, [[900]]);
+    } finally { emptyDb.close(); }
+    editor.acceptSaved(editor.snapshot()); editor.undo();
+    const restored = await writePurCopy(empty, editor.snapshot(), editor.deletedIds);
+    assert.equal((await parsePur(restored)).images[0].id, 1);
+    await assert.rejects(writePurCopy(source, [], [900]), /未対応/);
+    await assert.rejects(writePurCopy(source, [], [0, 0]), /重複/);
+    await assert.rejects(writePurCopy(source, editor.snapshot(), [1]), /重複/);
+    db.run("CREATE TABLE future_refs(image INTEGER); INSERT INTO future_refs VALUES(0)");
+    const unknown = wrapDatabase(original, db.export());
+    const preserved = await writePurCopy(unknown, [], [0, 1]);
+    const unknownDb = new SQL.Database(extractDatabase(preserved));
+    try {
+      assert.equal(unknownDb.exec("SELECT COUNT(*) FROM images")[0].values[0][0], 1);
+      assert.deepEqual(unknownDb.exec("SELECT image FROM future_refs")[0].values, [[0]]);
+    } finally { unknownDb.close(); }
+    db.run("INSERT INTO items(id,parent,name) VALUES(901,0,'child')");
+    await assert.rejects(writePurCopy(wrapDatabase(original, db.export()), [], [0]), /子要素/);
+  } finally { db.close(); }
+});
+
+test("Undo after a saved deletion restores exact sort keys, flags, names and unknown item columns", async () => {
+  const SQL = await sqlite();
+  const db = new SQL.Database(extractDatabase(original));
+  try {
+    db.run(`ALTER TABLE items ADD COLUMN future_payload TEXT;
+      UPDATE items SET locked=1,name='preserved name',future_payload=CAST(x'0001c3bf' AS TEXT);
+      UPDATE items_images SET flags=0,playback_speed=0.5;
+      INSERT INTO items(id,parent,transform,opacity,z,sort_order)
+      SELECT 1,parent,transform,opacity,z,sort_order FROM items;
+      INSERT INTO items_images(id,image,image_transform,image_bounds,flags,playback_state,playback_frame)
+      SELECT 1,image,image_transform,image_bounds,flags,playback_state,playback_frame FROM items_images;`);
+    const key = db.exec("SELECT CAST(sort_order AS BLOB) FROM items WHERE id=0")[0].values[0][0] as Uint8Array;
+    const reader = new Reader(Uint8Array.from(new TextDecoder().decode(key), c => c.charCodeAt(0)));
+    reader.pos = 5; reader.take(reader.u32()); reader.i32(); reader.u64();
+    const raw = reader.bytes.slice();
+    new DataView(raw.buffer).setUint32(reader.pos, 2);
+    db.run("UPDATE items SET sort_order=CAST(? AS TEXT) WHERE id=0",
+      [new TextEncoder().encode(Array.from(raw, c => String.fromCharCode(c)).join(""))]);
+    const source = wrapDatabase(original, db.export());
+    const board = await parsePur(source);
+    assert.deepEqual(board.images.map(image => image.id), [1, 0]);
+    const editor = new BoardEditor(board.images);
+    editor.select(0); editor.removeSelected();
+    const deleted = await writePurCopy(source, editor.snapshot(), editor.deletedIds);
+    editor.acceptSaved(editor.snapshot());
+    editor.undo();
+    const output = await writePurCopy(deleted, editor.snapshot(), editor.deletedIds);
+    assert.deepEqual((await parsePur(output)).images.map(image => image.id), [1, 0]);
+    const saved = new SQL.Database(extractDatabase(output));
+    try {
+      assert.deepEqual(saved.exec(`SELECT name,locked,typeof(future_payload),hex(CAST(future_payload AS BLOB)),
+        typeof(sort_order),hex(CAST(sort_order AS BLOB)) FROM items WHERE id=0`),
+      db.exec(`SELECT name,locked,typeof(future_payload),hex(CAST(future_payload AS BLOB)),
+        typeof(sort_order),hex(CAST(sort_order AS BLOB)) FROM items WHERE id=0`));
+      assert.deepEqual(saved.exec("SELECT flags,playback_speed FROM items_images WHERE id=0"),
+        db.exec("SELECT flags,playback_speed FROM items_images WHERE id=0"));
+    } finally { saved.close(); }
+  } finally { db.close(); }
+});
+
+test("new GIF WebP BMP and SVG rows embed original bytes, format and checksum through save, delete and Undo", async () => {
+  for (const [mime, data] of [
+    ["image/gif", gifFixture(true)], ["image/webp", animatedWebp([])], ["image/bmp", bmpFixture(true, true)],
+    ["image/svg+xml", svgFixture],
+  ] as const) {
+    const board = await parsePur(original);
+    const editor = new BoardEditor(board.images);
+    const image = editor.add({ ...board.images[0], data, mime, width: 3, height: 2 });
+    const output = await writePurCopy(original, editor.snapshot());
+    const reopened = await parsePur(output);
+    const added = reopened.images.find(value => value.id === image.id)!;
+    assert.deepEqual(added.data, data);
+    assert.equal(added.mime, mime);
+    const SQL = await sqlite(), saved = new SQL.Database(extractDatabase(output));
+    const hash = new SparkMD5.ArrayBuffer();
+    hash.append(Uint8Array.from(data).buffer);
+    try {
+      assert.deepEqual(saved.exec(`SELECT format,checksum,typeof(data),source_type FROM images
+        WHERE id=(SELECT image FROM items_images WHERE id=${image.id})`)[0].values[0],
+      [mime === "image/svg+xml" ? "SVG" : mime.slice(6).toUpperCase(), hash.end(), "blob", 1]);
+      assert.deepEqual(saved.exec(`SELECT flags,playback_state,playback_frame,playback_speed
+        FROM items_images WHERE id=${image.id}`)[0].values[0],
+      [1, mime === "image/gif" ? 3 : 0, 0, 1]);
+    } finally { saved.close(); }
+    editor.acceptSaved(editor.snapshot());
+    editor.removeSelected();
+    const deleted = await writePurCopy(output, editor.snapshot(), editor.deletedIds);
+    editor.acceptSaved(editor.snapshot());
+    editor.undo();
+    const restored = await parsePur(await writePurCopy(deleted, editor.snapshot()));
+    assert.deepEqual(restored.images.find(value => value.id === image.id)!.data, data);
+    assert.equal(restored.images.find(value => value.id === image.id)!.mime, mime);
+  }
 });

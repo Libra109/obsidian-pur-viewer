@@ -4,6 +4,10 @@ import { readFileSync } from "node:fs";
 import { webcrypto } from "node:crypto";
 import vm from "node:vm";
 import { test } from "node:test";
+import { imageDimensions } from "../src/image-import";
+import type { ImageEditState } from "../src/editor";
+import { animatedWebp, bmpFixture, gifFixture } from "./raster-fixtures";
+import { svgFixture } from "./svg-fixtures";
 
 test("browser bundle parses actual v2 and rejects legacy without Node, WASM assets or network", async () => {
   // Use the exact same build settings as the shipped plugin.
@@ -33,12 +37,35 @@ test("browser bundle parses actual v2 and rejects legacy without Node, WASM asse
   await assert.rejects(vm.runInContext("PurBrowser.parsePur(new Uint8Array(fixtureBytes))", sandbox), /未対応.*1\.10/);
 });
 
+test("HEIC browser bundle decodes with Node globals and without native, WASM, network or eval", async () => {
+  const { browserOptions } = await import("../build.mjs");
+  const bundle = await build({
+    ...browserOptions, entryPoints: ["src/heic.ts"], write: false, format: "iife", globalName: "HeicBrowser",
+  });
+  const sandbox = vm.createContext({
+    console, TextDecoder, TextEncoder, setTimeout, clearTimeout,
+    AbortController, window: {}, process: { versions: { node: "test" } },
+    require(name: string) { throw new Error(`Native dependency requested: ${name}`); },
+    fetch() { throw new Error("Network requested"); },
+    WebAssembly: new Proxy({}, { get() { throw new Error("WASM requested"); } }),
+    bytes: new Uint8Array(readFileSync(new URL("./fixtures/example.heic", import.meta.url))),
+  }, { codeGeneration: { strings: false, wasm: false } });
+  vm.runInContext(bundle.outputFiles[0].text, sandbox);
+  const result = await vm.runInContext(
+    "HeicBrowser.heicPixels(new Uint8Array(bytes),new AbortController().signal).then(p=>JSON.stringify({width:p.width,height:p.height,length:p.data.length}))",
+    sandbox);
+  assert.deepEqual(JSON.parse(result), { width: 1280, height: 854, length: 4372480 });
+});
+
 test("shipped CommonJS entry registers the pur view and opens files from the file menu", async () => {
   const { browserOptions } = await import("../build.mjs");
   const bundle = await build({
     ...browserOptions,
     entryPoints: ["src/main.ts"], write: false, format: "cjs", external: ["obsidian"], minify: true,
+    legalComments: "eof",
   });
+  const shippedEntry = readFileSync(new URL("../dist/main.js", import.meta.url), "utf8");
+  assert.equal(shippedEntry, bundle.outputFiles[0].text, "build dist before testing the shipped plugin");
   const requests: string[] = [];
   let fileMenuHandler: ((menu: MenuStub, file: FakeTFile) => void) | undefined;
   const menuActions: (() => void)[] = [];
@@ -80,8 +107,11 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   let autosaveDescription: ElementStub | undefined;
   let activeView: TestView | null = null;
   const domHandlers = new Map<ElementStub, Map<string, (event: unknown) => void>>();
+  const canvasHandlers = new Map<ElementStub, Map<string, (event: unknown) => void>>();
+  let imagePicker: { getItems(): FakeTFile[]; onChooseItem(file: FakeTFile): void } | undefined;
   let savedNotice: (() => void) | undefined;
   const fixture = readFileSync(new URL("../../crates/purcore/tests/fixtures/S1_redbar-new.pur", import.meta.url));
+  const heicFixture = new Uint8Array(readFileSync(new URL("./fixtures/example.heic", import.meta.url)));
   let closedBitmaps = 0;
   let pendingRead: Promise<ArrayBuffer> | undefined;
   const drawingContext = new Proxy({}, { get: () => () => {} });
@@ -102,9 +132,11 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     onUnloadFile(file: FakeTFile): Promise<void>;
     onClose(): Promise<void>;
     savePurCurrent(): Promise<void>;
+    importQueue: Promise<void>;
+    renderer: { insertionPoint(point?: { x: number; y: number }): { x: number; y: number } };
     onPaneMenu(menu: MenuStub, source: string): void;
     editor: {
-      snapshot(): Array<{ id: number; item: [number, number, number, number, number, number]; z: number }>;
+      snapshot(): ImageEditState[];
       bringToFront(id: number): void;
       setItem(id: number, matrix: number[]): void;
       commit(id: number, before: number[]): void;
@@ -129,7 +161,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   }
   class ElementStub {
     isContentEditable = false;
-    closest() { return null; }
+    closest() { return ["input", "textarea", "select"].includes(this.tagName) ? this : null; }
     textContent = "";
     hidden = false;
     tabIndex = 0;
@@ -158,7 +190,12 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     setAttribute(_name: string, _value: string) {}
     setText(text: string) { this.textContent = text; }
     getContext() { return drawingContext; }
-    addEventListener() {}
+    addEventListener(name: string, callback: (event: unknown) => void) {
+      const handlers = canvasHandlers.get(this) ?? new Map();
+      handlers.set(name, callback);
+      canvasHandlers.set(this, handlers);
+    }
+    focus() {}
     getBoundingClientRect() { return { left: 0, top: 0 }; }
     private child() {
       const element = new ElementStub();
@@ -187,6 +224,8 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     }
   }
   class Plugin {
+    readonly disposers: Array<() => void> = [];
+    register(callback: () => void) { this.disposers.push(callback); }
     viewType?: string;
     extensions?: string[];
     extensionType?: string;
@@ -299,6 +338,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
           return {};
         },
         getAbstractFileByPath: (path: string) => identities.get(path),
+        getFiles: () => [...identities.values()],
         readBinary: async (file: FakeTFile) => pendingRead ?? savedFiles.get(file.path) ?? liveFiles.get(file.path) ?? Uint8Array.from(fixture).buffer,
         modifyBinary: async (file: FakeTFile, bytes: ArrayBuffer) => {
           writeHook?.();
@@ -358,19 +398,57 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
     onClick(callback: () => void) { modalButtons.set(this.label, callback); return this; }
     setWarning() { return this; }
   }
+  class FuzzySuggestModal {
+    constructor(readonly app: FileView["app"]) {}
+    setPlaceholder() {}
+    getItems(): FakeTFile[] { return []; }
+    onChooseItem(_file: FakeTFile) {}
+    open() { imagePicker = this; }
+  }
   const sandbox = vm.createContext({
     console: { ...console, error: (...args: unknown[]) => loggedErrors.push(args) },
     TextDecoder, TextEncoder, setTimeout, clearTimeout, crypto: webcrypto, performance,
-    AbortController, window: {}, HTMLElement: ElementStub,
+    AbortController, DOMException, window: {}, HTMLElement: ElementStub, process: { versions: { node: "test" } },
     Blob,
-    createImageBitmap: async () => ({ width: 64, height: 48, close() { closedBitmaps++; } }),
+    atob, URL,
+    ImageData: class {
+      constructor(readonly data: Uint8ClampedArray, readonly width: number, readonly height: number) {}
+    },
+    DOMParser: class {
+      parseFromString(text: string) {
+        assert.equal(text, new TextDecoder().decode(svgFixture), "SVG DOM stub is limited to its known fixture");
+        const attrs: Record<string, string> = {
+          xmlns: "http://www.w3.org/2000/svg", width: "3", height: "2",
+        };
+        const root = {
+          localName: "svg", namespaceURI: "http://www.w3.org/2000/svg",
+          getAttribute: (name: string) => attrs[name] ?? null,
+          attributes: Object.entries(attrs).map(([localName, value]) => ({
+            localName, value, namespaceURI: localName === "xmlns" ? "http://www.w3.org/2000/xmlns/" : null,
+          })),
+        };
+        return { documentElement: root, querySelector: () => null, getElementsByTagName: () => [root] };
+      }
+    },
+    Image: class {
+      width = 0; height = 0;
+      onload?: () => void;
+      onerror?: () => void;
+      set src(value: string) { if (value) void Promise.resolve().then(() => this.onload?.()); }
+    },
+    document: { createElement: () => ({ width: 0, height: 0, getContext: () => drawingContext }) },
+    createImageBitmap: async (blob: Blob | { width: number; height: number }) => {
+      if (!(blob instanceof Blob)) return { width: blob.width, height: blob.height, close() { closedBitmaps++; } };
+      const dimensions = imageDimensions(new Uint8Array(await blob.arrayBuffer()));
+      return { width: dimensions.width, height: dimensions.height, close() { closedBitmaps++; } };
+    },
     ResizeObserver: class { observe() {} disconnect() {} },
     module: { exports: {} },
     require(name: string) {
       requests.push(name);
       if (name === "obsidian") {
         return {
-          Plugin, Modal, ButtonComponent, FileView, Menu: MenuStub, PluginSettingTab, Setting, Scope,
+          Plugin, Modal, FuzzySuggestModal, ButtonComponent, FileView, Menu: MenuStub, PluginSettingTab, Setting, Scope,
           Notice: class {
             private readonly noticeIndex: number;
             constructor(message: string) {
@@ -388,7 +466,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
       throw new Error(`Unexpected runtime dependency: ${name}`);
     },
   });
-  vm.runInContext(bundle.outputFiles[0].text, sandbox);
+  vm.runInContext(shippedEntry, sandbox);
   savedSettings = {
     debug: false,
     frontOnSelect: true,
@@ -414,7 +492,9 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   const livePlugin = vm.runInContext("testPlugin", sandbox) as {
     setAutosaveInterval(value: number): Promise<void>;
     autosaveDelaySeconds: number;
+    disposers: Array<() => void>;
   };
+  assert.equal(livePlugin.disposers.length, 1, "plugin unload registers HEIC Worker cleanup");
   assert.ok(createView);
   assert.equal(createView({}).canAcceptExtension("pur"), true);
   assert.ok(fileMenuHandler);
@@ -442,7 +522,7 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.ok(diagnosticsCommand);
   diagnosticsCommand.callback!();
   const diagnosticNotice = diagnosticOutputs[diagnosticOutputs.length - 1]?.value ?? "";
-  assert.ok(diagnosticNotice.includes("ビルド: 0.8.4"));
+  assert.ok(diagnosticNotice.includes("ビルド: 0.12.0"));
   assert.ok(diagnosticNotice.includes("ファイル読込 failed"));
   const first = new FakeTFile("boards/first.pur");
   const second = new FakeTFile("boards/second.pur");
@@ -866,6 +946,186 @@ test("shipped CommonJS entry registers the pur view and opens files from the fil
   assert.equal(idleEditor.dirty, false, "the real FileView integration saves after the idle debounce");
   assert.ok(liveFiles.get("boards/idle.pur")?.byteLength);
   await idleView.onClose();
+  const imageView = createView({});
+  liveFiles.set("boards/images.pur", Uint8Array.from(fixture).buffer);
+  await imageView.onOpen();
+  await imageView.setState({ file: "boards/images.pur" });
+  activeView = imageView;
+  const imageCanvas = imageView.contentEl.children[3];
+  const paste = domHandlers.get(imageView.contentEl)!.get("paste")!;
+  const drop = domHandlers.get(imageCanvas)!.get("drop")!;
+  const imageBytes = imageView.editor.snapshot()[0];
+  const png = (await parsePur(new Uint8Array(fixture))).images[0].data;
+  const pngFile = { size: png.length, arrayBuffer: async () => Uint8Array.from(png).buffer };
+  const clipboardData = { items: [{ kind: "file", getAsFile: () => pngFile }] };
+  let pastePrevented = false;
+  const plainInput = new ElementStub();
+  plainInput.tagName = "input";
+  paste({ target: plainInput, clipboardData, preventDefault: () => assert.fail("input paste was intercepted") });
+  paste({ target: { isContentEditable: false, closest: () => plainInput }, clipboardData,
+    preventDefault: () => assert.fail("a popout input paste was intercepted") });
+  paste({ target: imageCanvas, clipboardData: { items: [] },
+    preventDefault: () => assert.fail("text-only paste was intercepted") });
+  assert.equal(imageView.editor.snapshot().length, 1);
+  const center = imageView.renderer.insertionPoint();
+  paste({ target: imageCanvas, clipboardData, preventDefault: () => { pastePrevented = true; } });
+  await imageView.importQueue;
+  assert.equal(pastePrevented, true);
+  assert.equal(imageView.editor.snapshot().length, 2);
+  const pasted = imageView.editor.snapshot()[1];
+  assert.equal(pasted.item[4], center.x);
+  assert.equal(pasted.item[5], center.y);
+  assert.equal(imageView.editor.selectedId, pasted.id);
+  assert.ok(pasted.z > imageBytes.z);
+  const position = { x: 100, y: 120 };
+  const expectedPosition = imageView.renderer.insertionPoint(position);
+  let dropPrevented = false, dropStopped = false;
+  drop({ clientX: position.x, clientY: position.y, dataTransfer: { files: [pngFile] },
+    preventDefault: () => { dropPrevented = true; }, stopPropagation: () => { dropStopped = true; } });
+  await imageView.importQueue;
+  assert.equal(dropPrevented && dropStopped, true, "OS drops stay inside the PUR view");
+  const dropped = imageView.editor.snapshot()[2];
+  assert.equal(dropped.item[4], expectedPosition.x);
+  assert.equal(dropped.item[5], expectedPosition.y);
+  assert.equal(imageView.editor.snapshot().length, 3);
+  const vaultPng = new FakeTFile("assets/added.png");
+  const vaultJpeg = new FakeTFile("assets/added.jpg");
+  new FakeTFile("assets/unsupported.txt");
+  liveFiles.set(vaultPng.path, Uint8Array.from(png).buffer);
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("保管庫から画像を追加")!();
+  assert.ok(imagePicker);
+  assert.ok(imagePicker.getItems().includes(vaultPng) && imagePicker.getItems().includes(vaultJpeg));
+  assert.equal(imagePicker.getItems().some(file => file.extension === "txt"), false);
+  imagePicker.onChooseItem(vaultPng);
+  await imageView.importQueue;
+  assert.equal(imageView.editor.snapshot().length, 4);
+  const imageKeys = canvasHandlers.get(imageCanvas)!.get("keydown")!;
+  let deletePrevented = false;
+  imageKeys({ key: "Delete", preventDefault: () => { deletePrevented = true; } });
+  assert.equal(deletePrevented, true);
+  assert.equal(imageView.editor.snapshot().length, 3);
+  imageView.editor.undo();
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("選択した画像を削除")!();
+  assert.equal(imageView.editor.snapshot().length, 3);
+  imageView.editor.undo();
+  imageKeys({ key: "Backspace", preventDefault() {} });
+  assert.equal(imageView.editor.snapshot().length, 3);
+  imageView.editor.undo();
+  imageKeys({ key: "v", ctrlKey: true, preventDefault: () => assert.fail("native Ctrl+V was blocked") });
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("閲覧モードへ")!();
+  paste({ target: imageCanvas, clipboardData, preventDefault: () => assert.fail("read-only paste was intercepted") });
+  imageKeys({ key: "Delete", preventDefault: () => assert.fail("read-only Delete was intercepted") });
+  assert.equal(imageView.editor.snapshot().length, 4);
+  imageView.onPaneMenu(new MenuStub(), "more-options");
+  titledActions.get("編集モードへ")!();
+  const invalidFile = { size: 4, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
+  drop({ clientX: 0, clientY: 0, dataTransfer: { files: [invalidFile] }, preventDefault() {}, stopPropagation() {} });
+  await imageView.importQueue;
+  assert.equal(imageView.editor.snapshot().length, 4);
+  assert.ok(notices.some(message => message.includes("対応する画像はPNG、JPEG、GIF、WebP、BMP")));
+  await new Promise(resolve => setTimeout(resolve, 3200));
+  assert.equal(imageView.editor.dirty, false, "image addition participates in idle autosave");
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!))).images.length, 4);
+  imageView.editor.select(pasted.id);
+  imageKeys({ key: "Delete", preventDefault() {} });
+  await imageView.savePurCurrent();
+  assert.equal(imageView.editor.dirty, false);
+  const deletedOutput = new Uint8Array(liveFiles.get("boards/images.pur")!);
+  assert.equal((await parsePur(deletedOutput)).images.length, 3);
+  imageView.editor.undo();
+  await imageView.savePurCurrent();
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!))).images.length, 4,
+    "Undo after saving a deletion recreates its image rows");
+  imageView.editor.select(dropped.id);
+  imageKeys({ key: "Delete", preventDefault() {} });
+  backupHook = async () => { imageView.editor.undo(); };
+  await imageView.savePurCurrent();
+  backupHook = undefined;
+  assert.equal(imageView.editor.dirty, true, "Undo during a deletion save remains dirty against its new baseline");
+  const concurrentDeletion = new Uint8Array(liveFiles.get("boards/images.pur")!);
+  assert.equal((await parsePur(concurrentDeletion)).images.length, 3);
+  await new Promise(resolve => setTimeout(resolve, 3200));
+  assert.equal(imageView.editor.dirty, false, "concurrent membership edits resume idle autosave");
+  assert.equal((await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!))).images.length, 4);
+  const managedImages = (savedSettings?.backups ?? []) as Array<{ source: string; path: string }>;
+  const imageBackups = managedImages.filter(record => record.source === "boards/images.pur");
+  assert.equal(imageBackups.length, 1, "image edits retain exactly one managed backup generation");
+  assert.deepEqual(new Uint8Array(savedFiles.get(imageBackups[0].path)!), concurrentDeletion,
+    "the remaining recovery copy contains the immediately preceding deletion");
+  for (const [extension, data] of [
+    ["gif", gifFixture(true)], ["webp", animatedWebp([])], ["bmp", bmpFixture(true)], ["svg", svgFixture],
+    ["heic", heicFixture],
+  ] as const) {
+    const file = { size: data.length, arrayBuffer: async () => Uint8Array.from(data).buffer };
+    const beforeCount = imageView.editor.snapshot().length;
+    paste({ target: imageCanvas, clipboardData: { items: [{ kind: "file", getAsFile: () => file }] },
+      preventDefault() {} });
+    await imageView.importQueue;
+    assert.equal(imageView.editor.snapshot().length, beforeCount + 1, `${extension}: clipboard adds image`);
+    drop({ clientX: 20, clientY: 30, dataTransfer: { files: [file] }, preventDefault() {}, stopPropagation() {} });
+    await imageView.importQueue;
+    const vaultImage = new FakeTFile(`assets/new.${extension}`);
+    liveFiles.set(vaultImage.path, Uint8Array.from(data).buffer);
+    imageView.onPaneMenu(new MenuStub(), "more-options");
+    titledActions.get("保管庫から画像を追加")!();
+    assert.ok(imagePicker!.getItems().includes(vaultImage));
+    imagePicker!.onChooseItem(vaultImage);
+    await imageView.importQueue;
+    assert.equal(imageView.editor.snapshot().length, beforeCount + 3, `${extension}: all three import paths work`);
+    imageView.editor.undo(); imageView.editor.redo();
+    if (extension === "gif" || extension === "heic") {
+      await new Promise(resolve => setTimeout(resolve, 3200));
+      assert.equal(imageView.editor.dirty, false, `${extension}: unmodified import participates in idle autosave`);
+    } else await imageView.savePurCurrent();
+    const reopened = await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!));
+    const newImages = reopened.images.slice(-3);
+    assert.ok(newImages.every(image => image.mime === (extension === "svg" ? "image/svg+xml" : `image/${extension}`) &&
+      image.width === (extension === "heic" ? 1280 : 3) && image.height === (extension === "heic" ? 854 : 2)),
+      `${extension}: original format saves and reopens on all import paths`);
+    for (const image of newImages)
+      assert.deepEqual(image.data, data, `${extension}: every import path preserves every received byte`);
+    assert.equal(imageView.editor.dirty, false);
+  }
+  const dataUrl = `data:image/svg+xml;base64,${Buffer.from(svgFixture).toString("base64")}`;
+  paste({ target: plainInput, clipboardData: { items: [], getData: () => dataUrl },
+    preventDefault: () => assert.fail("SVG URL input paste was intercepted") });
+  const beforeSvg = imageView.editor.snapshot().length;
+  let svgPastePrevented = false;
+  paste({ target: imageCanvas, clipboardData: { items: [], getData: () => dataUrl },
+    preventDefault() { svgPastePrevented = true; } });
+  await imageView.importQueue;
+  assert.equal(svgPastePrevented, true);
+  assert.equal(imageView.editor.snapshot().length, beforeSvg + 1);
+  await imageView.savePurCurrent();
+  const svgReopened = await parsePur(new Uint8Array(liveFiles.get("boards/images.pur")!));
+  assert.deepEqual(svgReopened.images[svgReopened.images.length - 1].data, svgFixture);
+  paste({ target: imageCanvas, clipboardData: { items: [], getData: () => "data:image/svg+xml;base64,@@@" },
+    preventDefault() {} });
+  await imageView.importQueue;
+  assert.equal(imageView.editor.snapshot().length, beforeSvg + 1);
+  assert.ok(notices.some(message => message.includes("Base64")));
+  await imageView.onClose();
+  const reopenedView = createView({}) as typeof imageView;
+  await reopenedView.onOpen();
+  const savedImageFile = identities.get("boards/images.pur")!;
+  const savedImageBytes = liveFiles.get(savedImageFile.path)!;
+  const expectedImages = (await parsePur(new Uint8Array(savedImageBytes))).images;
+  const errorsBeforeReload = loggedErrors.length;
+  await reopenedView.onLoadFile(savedImageFile);
+  assert.equal(loggedErrors.length, errorsBeforeReload, "shipped plugin reloads HEIC-containing PUR without errors");
+  assert.equal(reopenedView.editor.snapshot().length, expectedImages.length);
+  const reloadedHeic = reopenedView.editor.snapshot().map(image => image.content)
+    .filter(image => image.mime === "image/heic");
+  assert.equal(reloadedHeic.length, 3, "existing PUR load includes all HEIC images");
+  for (const image of reloadedHeic) assert.deepEqual(Uint8Array.from(image.data), heicFixture);
+  diagnosticsCommand.callback!();
+  assert.match(diagnosticOutputs[diagnosticOutputs.length - 1]!.value, /frame drawn/);
+  assert.equal(liveFiles.get(savedImageFile.path), savedImageBytes, "opening PUR does not rewrite its bytes");
+  await reopenedView.onClose();
+  for (const dispose of livePlugin.disposers) dispose();
   const manifest = JSON.parse(readFileSync(new URL("../manifest.json", import.meta.url), "utf8"));
   assert.equal(manifest.isDesktopOnly, false);
 });

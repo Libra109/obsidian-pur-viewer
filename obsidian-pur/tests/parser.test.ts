@@ -8,6 +8,7 @@ import { Reader } from "../src/binary";
 import { boardBounds, imageMime, multiply, transform } from "../src/board";
 import { compareOrder, decodeClip, decodeOrder, decodeTransform } from "../src/codecs";
 import { extractDatabase, MAX_FILE_BYTES, parsePur, sqlite } from "../src/parser";
+import { gifFixture } from "./raster-fixtures";
 
 const fixtures = new URL("../../crates/purcore/tests/fixtures/", import.meta.url);
 export function fixture(name: string): Uint8Array {
@@ -137,6 +138,26 @@ test("unsupported items warn visibly instead of pretending to render", async () 
   } finally { db.close(); }
 });
 
+test("GIF display ignores saved playback state and frame while retaining both", async () => {
+  const data = gifFixture(true);
+  const db = await database();
+  try {
+    db.run("UPDATE images SET width=3,height=2,data=?,format='GIF'", [data]);
+    for (const state of [null, -1, 0, 1, 2, 3, 4, 255]) {
+      for (const frame of [null, -1, 0, 1, 23, 999]) {
+        db.run("UPDATE items_images SET playback_state=?,playback_frame=?", [state, frame]);
+        const board = await parsePur(container(db.export()));
+        assert.equal(board.images.length, 1);
+        assert.deepEqual(board.images[0].data, data);
+        assert.equal(board.images[0].stored!.imageItem.values.playback_state, state);
+        assert.equal(board.images[0].stored!.imageItem.values.playback_frame, frame);
+      }
+    }
+    db.run("UPDATE items_images SET playback_state=3; UPDATE images SET format='PNG',data=x'00010203'");
+    assert.equal((await parsePur(container(db.export()))).images.length, 0);
+  } finally { db.close(); }
+});
+
 test("opacity and affine image placement are retained", async () => {
   const db = await database();
   try {
@@ -191,11 +212,12 @@ test("z and exact rational sort keys determine draw order, not database row orde
   } finally { db.close(); }
 });
 
-test("recognizes raster MIME signatures and refuses SVG and external markup", () => {
+test("recognizes image signatures including SVG before decoder validation", () => {
   assert.equal(imageMime(new Uint8Array([255, 216, 255, 0])), "image/jpeg");
   assert.equal(imageMime(new TextEncoder().encode("GIF89a")), "image/gif");
   assert.equal(imageMime(new TextEncoder().encode("RIFF0000WEBP")), "image/webp");
-  assert.equal(imageMime(new TextEncoder().encode("<svg onload='alert(1)'/>")), undefined);
+  assert.equal(imageMime(new TextEncoder().encode("<svg onload='alert(1)'/>")), "image/svg+xml");
+  assert.equal(imageMime(new TextEncoder().encode("<html><svg/></html>")), undefined);
 });
 
 test("rational order compares exactly beyond floating point precision", () => {

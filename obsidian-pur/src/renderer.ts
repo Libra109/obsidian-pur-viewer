@@ -3,6 +3,7 @@ import { BoardImage, boardBounds, Bounds, Clip, invert, Matrix, multiply, Point,
 import { Camera, gesturePoints } from "./camera";
 import { BoardEditor } from "./editor";
 import { drawGrid } from "./grid";
+import { decodeRaster, imageDimensions } from "./image-import";
 import {
   flipItem, imageCenter, imageHandles, resizeCursor, resizeFromHandle, rotateMatrixAboutPoint, rotationHandles,
 } from "./handles";
@@ -19,7 +20,15 @@ export async function decodeImages(images: BoardImage[], signal: AbortSignal): P
   try {
     for (const image of images) {
       signal.throwIfAborted();
-      const bitmap = await createImageBitmap(new Blob([Uint8Array.from(image.data)], { type: image.mime }));
+      if (["image/gif", "image/webp", "image/bmp", "image/svg+xml"].includes(image.mime)) {
+        const dimensions = imageDimensions(image.data);
+        check(dimensions.width === image.width && dimensions.height === image.height,
+          "画像ヘッダーの寸法と保存寸法が一致しません");
+      }
+      check(pixels + image.width * image.height <= 80_000_000, "合計80メガピクセルの上限を超えています");
+      const bitmap = await decodeRaster(image.data, image.mime, signal, {
+        maxPixels: 80_000_000 - pixels, width: image.width, height: image.height,
+      });
       if (signal.aborted) { bitmap.close(); signal.throwIfAborted(); }
       pixels += bitmap.width * bitmap.height;
       if (bitmap.width !== image.width || bitmap.height !== image.height || pixels > 80_000_000) {
@@ -321,7 +330,11 @@ export class BoardRenderer {
       this.render();
     }, { passive: false, signal });
     canvas.addEventListener("keydown", event => {
-      if (this.editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+      if (this.editing && !event.ctrlKey && !event.metaKey && !event.altKey &&
+        (event.key === "Delete" || event.key === "Backspace")) {
+        if (!this.editor.selected) return;
+        this.removeSelected();
+      } else if (this.editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
         if (event.shiftKey) this.redo(); else this.undo();
       } else if (this.editing && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") this.redo();
       else if (event.key === "0") this.fit();
@@ -359,7 +372,7 @@ export class BoardRenderer {
 
   fit(): void {
     if (!this.canvas.clientWidth || !this.canvas.clientHeight) return;
-    this.camera.fit(boardBounds(this.images.map(entry => entry.image)), this.canvas.clientWidth, this.canvas.clientHeight);
+    this.camera.fit(boardBounds(this.editor.images), this.canvas.clientWidth, this.canvas.clientHeight);
     this.fitted = true;
     this.render();
   }
@@ -371,6 +384,31 @@ export class BoardRenderer {
   }
 
   get canTransformSelected(): boolean { return this.editing && this.editor.selected !== undefined; }
+  get retainedPixels(): number {
+    return this.images.reduce((sum, entry) => sum + entry.bitmap.width * entry.bitmap.height, 0);
+  }
+  get retainedBytes(): number {
+    return this.images.reduce((sum, entry) => sum + entry.image.data.length, 0);
+  }
+  get retainedCount(): number { return this.images.length; }
+  insertionPoint(client?: Point): Point {
+    const rect = this.canvas.getBoundingClientRect();
+    return this.worldPoint(client ? { x: client.x - rect.left, y: client.y - rect.top }
+      : { x: this.canvas.clientWidth / 2, y: this.canvas.clientHeight / 2 });
+  }
+  addImage(content: Omit<BoardImage, "id" | "z">, bitmap: ImageBitmap): void {
+    this.finishPendingEdit();
+    const image = this.editor.add(content);
+    this.images.push({ image, bitmap });
+    this.tieOrder.set(image.id, this.tieOrder.size);
+    this.renderImmediately();
+  }
+  removeSelected(): void {
+    if (!this.canTransformSelected) return;
+    this.finishPendingEdit();
+    this.editor.removeSelected();
+    this.renderImmediately();
+  }
   rotateSelected(angle: number): void {
     const image = this.editor.selected;
     if (!this.canTransformSelected || !image) return;
@@ -419,12 +457,12 @@ export class BoardRenderer {
       context.scale(ratioX, ratioY);
       drawGrid(context, this.camera, this.canvas.clientWidth, this.canvas.clientHeight);
       this.sortDecodedImages();
-      drawBoard(context, this.images, this.camera);
+      drawBoard(context, this.activeImages(), this.camera);
       if (this.editing) {
         drawSelection(context, this.editor, this.camera);
       }
       if (diagnostic) diagnostic.renderedFrames++;
-      this.onState(`frame drawn; canvas ${this.canvas.clientWidth} x ${this.canvas.clientHeight}; images ${this.images.length}`);
+      this.onState(`frame drawn; canvas ${this.canvas.clientWidth} x ${this.canvas.clientHeight}; images ${this.editor.images.length}`);
     } catch (error) {
       if (diagnostic)
         this.onInteractionDiagnostic(`${diagnostic.kind} draw failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -476,6 +514,10 @@ export class BoardRenderer {
     this.images.sort((a, b) => a.image.z - b.image.z ||
       this.tieOrder.get(a.image.id)! - this.tieOrder.get(b.image.id)!);
   }
+  private activeImages(): DecodedImage[] {
+    const ids = new Set(this.editor.images.map(image => image.id));
+    return this.images.filter(entry => ids.has(entry.image.id));
+  }
   private worldPoint(point: Point): Point {
     return { x: (point.x - this.camera.x) / this.camera.scale, y: (point.y - this.camera.y) / this.camera.scale };
   }
@@ -483,8 +525,9 @@ export class BoardRenderer {
     this.sortDecodedImages();
     const world = { x: (screen.x - this.camera.x) / this.camera.scale,
       y: (screen.y - this.camera.y) / this.camera.scale };
-    for (let i = this.images.length - 1; i >= 0; i--) {
-      const image = this.images[i].image;
+    const images = this.activeImages();
+    for (let i = images.length - 1; i >= 0; i--) {
+      const image = images[i].image;
       const inverse = invert(multiply(image.item, image.image));
       if (!inverse) continue;
       const local = transform(inverse, world);

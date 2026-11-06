@@ -6,9 +6,14 @@ import { browserOptions } from "../build.mjs";
 const bundle = await build({
   ...browserOptions, entryPoints: ["tests/browser-harness.ts"], write: false, format: "iife",
 });
+const heicApi = await build({
+  ...browserOptions, entryPoints: ["src/heic.ts"], write: false, format: "iife", globalName: "Heic",
+});
 const routes = new Map([
   ["/fixture/v2", await readFile(new URL("../../crates/purcore/tests/fixtures/S1_redbar-new.pur", import.meta.url))],
+  ["/fixture/heic", await readFile(new URL("./fixtures/example.heic", import.meta.url))],
   ["/test.js", bundle.outputFiles[0].contents],
+  ["/heic-api.js", heicApi.outputFiles[0].contents],
   ["/styles.css", await readFile(new URL("../styles.css", import.meta.url))],
 ]);
 const html = `<!doctype html><html lang="ja"><meta charset="utf-8"><title>PUR browser smoke test</title>

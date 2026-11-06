@@ -1,5 +1,5 @@
-import { App, ButtonComponent, FileView, Menu, Modal, Notice, Plugin, PluginSettingTab, Scope, Setting, TFile, WorkspaceLeaf } from "obsidian";
-import { boardBounds } from "./board";
+import { App, ButtonComponent, FileView, FuzzySuggestModal, Menu, Modal, Notice, Plugin, PluginSettingTab, Scope, Setting, TFile, WorkspaceLeaf } from "obsidian";
+import { boardBounds, Point } from "./board";
 import { BoardEditor } from "./editor";
 import { MAX_FILE_BYTES, parsePur } from "./parser";
 import { BoardRenderer, decodeImages } from "./renderer";
@@ -9,12 +9,22 @@ import { writePurCopy } from "./writer";
 import { overwriteVerified } from "./overwrite";
 import { BackupRecord, BackupStore, PurBackups } from "./backups";
 import { IdleAutosave } from "./autosave";
+import { importImage } from "./image-import";
+import { svgDataUrl } from "./svg";
+import { disposeHeicWorker, setHeicFallbackHandler } from "./heic";
 
 const VIEW_TYPE = "lazyref-pur-view";
-const BUILD_ID = "0.8.4";
+const BUILD_ID = "0.12.0";
 const DEFAULT_AUTOSAVE_SECONDS = 3;
 const MIN_AUTOSAVE_SECONDS = 1;
 const MAX_AUTOSAVE_SECONDS = 60;
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!target) return false;
+  if ("isContentEditable" in target && target.isContentEditable === true) return true;
+  return "closest" in target && typeof target.closest === "function" &&
+    Boolean(target.closest("input, textarea, select, [contenteditable=true]"));
+}
 
 function sameSnapshot(
   left: ReturnType<BoardEditor["snapshot"]>,
@@ -82,7 +92,7 @@ class CopyNameModal extends Modal {
     return new Promise(resolve => { this.resolveResult = resolve; this.open(); });
   }
   onOpen(): void {
-    this.setTitle("画像配置を別名の .pur へ保存");
+    this.setTitle("編集内容を別名の .pur へ保存");
     this.contentEl.createEl("p", { text: "元ファイルと同じフォルダーへ新規作成します。既存ファイルは上書きしません。" });
     const input = this.contentEl.createEl("input", { type: "text", value: this.suggested });
     input.setAttribute("aria-label", "保存する .pur ファイル名");
@@ -94,6 +104,18 @@ class CopyNameModal extends Modal {
     });
   }
   onClose(): void { this.resolveResult?.(undefined); this.resolveResult = undefined; }
+}
+
+class VaultImageModal extends FuzzySuggestModal<TFile> {
+  constructor(app: App, private readonly choose: (file: TFile) => void) {
+    super(app);
+    this.setPlaceholder("追加するPNG / JPEG / GIF / WebP / BMP画像を選択");
+  }
+  getItems(): TFile[] {
+    return this.app.vault.getFiles().filter(file => /^(png|jpe?g|gif|webp|bmp|svg|heic|heif)$/i.test(file.extension));
+  }
+  getItemText(file: TFile): string { return file.path; }
+  onChooseItem(file: TFile): void { this.choose(file); }
 }
 
 class PurView extends FileView {
@@ -130,6 +152,7 @@ class PurView extends FileView {
   private externalChanged = false;
   private modifyPending = false;
   private backupPath?: string;
+  private importQueue: Promise<void> = Promise.resolve();
 
   constructor(leaf: WorkspaceLeaf, private readonly diagnostics: ViewerDiagnostics, private readonly purPlugin: PurPlugin) {
     super(leaf);
@@ -139,9 +162,7 @@ class PurView extends FileView {
     }, purPlugin.autosaveDelaySeconds * 1000);
     this.scope = new Scope(this.app.scope);
     this.scope.register(["Mod"], "s", event => {
-      const target = event.target;
-      if (target instanceof HTMLElement &&
-        (target.isContentEditable || target.closest("input, textarea, select, [contenteditable=true]"))) return;
+      if (isEditableTarget(event.target)) return;
       event.preventDefault();
       void this.savePurCurrent();
       return false;
@@ -224,6 +245,33 @@ class PurView extends FileView {
     this.canvas.tabIndex = 0;
     this.canvas.setAttribute("aria-label",
       "PUR画像ボード。閲覧時はドラッグで移動、ピンチまたはホイールで拡大縮小。編集時は画像をドラッグして移動し、角の枠をドラッグして拡縮。");
+    this.registerDomEvent(this.contentEl, "paste", event => {
+      if (!this.canAddImages || isEditableTarget(event.target)) return;
+      const files = Array.from(event.clipboardData?.items ?? [])
+        .filter(item => item.kind === "file").map(item => item.getAsFile())
+        .filter((file): file is File => file !== null);
+      if (!files.length) {
+        const text = event.clipboardData?.getData?.("text/plain") ?? "";
+        if (!/^\s*data:image\/svg\+xml[;,]/i.test(text)) return;
+        event.preventDefault();
+        this.queueImageRead(async () => svgDataUrl(text));
+        return;
+      }
+      event.preventDefault();
+      this.queueImageFiles(files);
+    });
+    this.registerDomEvent(this.canvas, "dragover", event => {
+      if (!this.canAddImages || !event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    });
+    this.registerDomEvent(this.canvas, "drop", event => {
+      if (!this.canAddImages || !event.dataTransfer?.files.length) return;
+      event.preventDefault();
+      event.stopPropagation();
+      this.canvas?.focus();
+      this.queueImageFiles(Array.from(event.dataTransfer.files), { x: event.clientX, y: event.clientY });
+    });
     this.addAction("more-horizontal", "PUR操作（保存、元に戻す、全体表示）", event => this.showPurMenu(event));
     this.registerDomEvent(this.canvas, "contextmenu", event => {
       event.preventDefault();
@@ -304,6 +352,8 @@ class PurView extends FileView {
       menu.addItem(item => item.setTitle(title).setDisabled(disabled).onClick(callback));
     action("保存（現在の .pur を上書き）", () => void this.savePurCurrent(), !this.sourceBytes || this.saving);
     action("別名 .pur 保存", () => void this.savePurCopy(), !this.sourceBytes || this.saving);
+    action("保管庫から画像を追加", () => this.chooseVaultImage(), !this.canAddImages);
+    action("選択した画像を削除", () => this.renderer?.removeSelected(), !this.renderer?.canTransformSelected);
     action("元に戻す", () => this.renderer?.undo(), !this.editor?.canUndo);
     action("やり直す", () => this.renderer?.redo(), !this.editor?.canRedo);
     action("90°時計回りに回転", () => this.renderer?.rotateSelected(Math.PI / 2),
@@ -325,6 +375,57 @@ class PurView extends FileView {
       action("直前の復旧用コピーの場所", () => new Notice(`復旧用コピー: ${backup}`, 15000));
     }
     action("ビューを閉じる", () => void this.closeView());
+  }
+
+  private get canAddImages(): boolean {
+    return !this.closed && Boolean(this.sourceBytes && this.editor && this.renderer) &&
+      this.editButton?.dataset.editing === "true";
+  }
+  private queueImageFiles(files: File[], client?: Point): void {
+    for (const file of files) {
+      this.queueImageRead(async () => {
+        if (file.size > MAX_FILE_BYTES) throw new Error("64 MiBを超える画像は追加できません");
+        return new Uint8Array(await file.arrayBuffer());
+      }, client);
+    }
+  }
+  private chooseVaultImage(): void {
+    if (!this.canAddImages) return;
+    const loadId = this.loadId;
+    new VaultImageModal(this.app, file => {
+      if (this.loadId !== loadId || !this.canAddImages) {
+        this.reportFailure("画像追加", new Error("画像の選択中にビューが変更されました"));
+        return;
+      }
+      this.queueImageRead(async () => {
+        const path = file.path;
+        if (file.stat.size > MAX_FILE_BYTES) throw new Error("64 MiBを超える画像は追加できません");
+        const data = new Uint8Array(await this.app.vault.readBinary(file));
+        if (file.path !== path || this.app.vault.getAbstractFileByPath(path) !== file)
+          throw new Error("画像の読込中にファイルが改名または削除されました");
+        return data;
+      });
+    }).open();
+  }
+  private queueImageRead(read: () => Promise<Uint8Array>, client?: Point): void {
+    const renderer = this.renderer, editor = this.editor, loadId = this.loadId;
+    const signal = this.loading?.signal;
+    if (!renderer || !editor || !signal) return;
+    const center = renderer.insertionPoint(client);
+    this.importQueue = this.importQueue.then(async () => {
+      const current = () => this.loadId === loadId && this.renderer === renderer && this.canAddImages;
+      if (!current()) throw new Error("読込先のPURビューが変更されました");
+      const data = await read();
+      if (!current()) throw new Error("画像の読込中にPURビューが変更されました");
+      if (renderer.retainedCount >= 10000) throw new Error("Undo用の画像を含む10000画像の上限に達しています");
+      if (renderer.retainedBytes + data.length > MAX_FILE_BYTES)
+        throw new Error("Undo用の画像データを含む64 MiBの上限を超えています");
+      const { content, bitmap } = await importImage(data, center, renderer.retainedPixels, signal);
+      try {
+        if (!current()) throw new Error("画像の展開中にPURビューが変更されました");
+        renderer.addImage(content, bitmap);
+      } catch (error) { bitmap.close(); throw error; }
+    }).catch(error => this.reportFailure("画像追加", error));
   }
 
   runPurAction(action: "save" | "undo" | "redo" | "fit" | "menu"): void {
@@ -436,7 +537,7 @@ class PurView extends FileView {
         try { this.onEditorChange(); }
         catch (error) { this.reportFailure("編集状態の更新", error); }
       },
-        board.maxHiddenRootZ, board.frontmostRootId);
+        board.maxHiddenRootZ, board.frontmostRootId, board.maxItemId);
       this.trace("renderer initialized; waiting for frame");
       try {
         this.renderer = new BoardRenderer(this.canvas, images, bounds, this.editor,
@@ -447,7 +548,7 @@ class PurView extends FileView {
       catch (error) { for (const { bitmap } of images) bitmap.close(); throw error; }
       this.loadedFile = file;
       this.sourceBytes = bytes;
-      this.warnings = board.images.length ? board.warnings : ["表示できる画像がありません", ...board.warnings];
+      this.warnings = board.warnings;
       this.renderer.setEditMode(true);
       if (this.editButton) {
         this.editButton.dataset.editing = "true";
@@ -536,7 +637,7 @@ class PurView extends FileView {
     if (!editor?.dirty) return;
     const discard = await new ConfirmModal(
       this.app, "編集内容を破棄しますか？",
-      "最後の上書き保存時（未保存なら読込時）の配置へ戻します。別名保存済みのコピーは残ります。",
+      "最後の上書き保存時（未保存なら読込時）の画像と配置へ戻します。別名保存済みのコピーは残ります。",
       "変更を破棄", "編集へ戻る",
     ).show();
     if (discard && !this.closed && this.loadId === loadId && this.editor === editor) this.renderer?.discardEdits();
@@ -578,14 +679,12 @@ class PurView extends FileView {
       if (this.closed || loadId !== this.loadId) throw new Error("ビューが変更されたため保存を中止しました");
       const path = copyPath(sourcePath, name);
       const placements = editor.snapshot();
+      const deletedIds = editor.deletedIds;
       const current = () => !this.closed && loadId === this.loadId && file.path === sourcePath && editor === this.editor &&
-        placements.every(placement => {
-          const image = editor.images.find(image => image.id === placement.id);
-          return image && image.z === placement.z && placement.item.every((value, i) => value === image.item[i]);
-        });
+        sameSnapshot(placements, editor.snapshot());
       if (!sameBytes(source, new Uint8Array(await this.app.vault.readBinary(file))))
         throw new Error("元ファイルが外部更新されています。再読込前に現在の編集を別途確認してください");
-      const output = await writePurCopy(source, placements);
+      const output = await writePurCopy(source, placements, deletedIds);
       await saveVerifiedCopy({
         source: async () => new Uint8Array(await this.app.vault.readBinary(file)),
         exists: async target => this.app.vault.adapter.exists(target),
@@ -639,9 +738,11 @@ class PurView extends FileView {
       return;
     }
     let placements: ReturnType<BoardEditor["snapshot"]>;
+    let deletedIds: number[];
     try {
       this.renderer?.finishPendingEdit();
       placements = editor.snapshot();
+      deletedIds = editor.deletedIds;
     } catch (error) {
       this.reportFailure(reason === "autosave" ? "自動保存" : "保存準備", error);
       this.autosave.resume(editor.dirty);
@@ -656,7 +757,7 @@ class PurView extends FileView {
     this.purPlugin.savingPaths.add(path);
     this.updateEditorControls();
     try {
-      const output = await writePurCopy(source, placements);
+      const output = await writePurCopy(source, placements, deletedIds);
       const backupStore: BackupStore = {
         exists: name => this.app.vault.adapter.exists(name),
         read: async name => new Uint8Array(await this.app.vault.adapter.readBinary(name)),
@@ -744,6 +845,7 @@ class PurView extends FileView {
     }
     if (this.alerts) {
       const messages = [
+        editor && !editor.images.length ? "表示できる画像がありません" : "",
         this.editor?.dirty ? "未保存変更" : "",
         this.saving ? "保存中…" : "",
         this.externalChanged ? "外部更新あり。保存前に再読込または復旧が必要です" : "",
@@ -759,8 +861,8 @@ class PurView extends FileView {
     this.updateEditorControls();
     const editor = this.editor;
     const snapshot = this.savingSnapshot;
-    if (this.saving && editor?.dirty && snapshot && !sameSnapshot(editor.snapshot(), snapshot))
-      this.autosave.changed(true);
+    if (this.saving && editor && snapshot)
+      this.autosave.changed(!sameSnapshot(editor.snapshot(), snapshot));
     else if (!this.saving) this.autosave.changed(Boolean(editor?.dirty));
   }
 
@@ -870,6 +972,11 @@ export default class PurPlugin extends Plugin {
       });
     }));
     this.addSettingTab(new PurSettings(this.app, this));
+    setHeicFallbackHandler(message => {
+      this.diagnostics.pluginStage = `HEIC fallback: ${message}`;
+      new Notice(message, 10000);
+    });
+    this.register(() => { disposeHeicWorker(); setHeicFallbackHandler(); });
     this.diagnostics.pluginStage = `onload entered; build ${BUILD_ID}`;
     this.registerView(VIEW_TYPE, leaf => {
       const view = new PurView(leaf, this.diagnostics, this);

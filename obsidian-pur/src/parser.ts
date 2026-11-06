@@ -1,7 +1,7 @@
 import initSqlJs from "sql.js/dist/sql-asm.js";
 import type { Database, SqlJsStatic, SqlValue } from "sql.js";
 import { check, Reader, verifyChecksum } from "./binary";
-import { Board, BoardImage, imageMime } from "./board";
+import { Board, BoardImage, imageMime, StoredRow } from "./board";
 import { compareOrder, decodeClip, decodeOrder, decodeTransform, Rational } from "./codecs";
 
 export const MAX_FILE_BYTES = 64 * 1024 * 1024;
@@ -40,6 +40,25 @@ function rows(db: Database, query: string): Row[] {
     while (statement.step()) result.push(statement.getAsObject());
     return result;
   } finally { statement.free(); }
+}
+
+function storedRows(db: Database, table: string, where = ""): Map<number, StoredRow> {
+  const columns = rows(db, `PRAGMA table_info("${table}")`).map(row => String(row.name));
+  const quoted = (name: string) => `"${name.replace(/"/g, '""')}"`;
+  const expressions = columns.flatMap((column, index) => [
+    `CASE WHEN typeof(${quoted(column)})='text' THEN CAST(${quoted(column)} AS BLOB)
+      ELSE ${quoted(column)} END AS ${quoted(column)}`,
+    `typeof(${quoted(column)}) AS "__stored_type_${index}"`,
+  ]);
+  return new Map(rows(db, `SELECT ${expressions.join(",")} FROM "${table}" ${where}`).map(row => {
+    const values: Row = {};
+    const textColumns: string[] = [];
+    columns.forEach((column, index) => {
+      values[column] = row[column];
+      if (row[`__stored_type_${index}`] === "text") textColumns.push(column);
+    });
+    return [integer(row.id, `${table}.id`), { values, textColumns }];
+  }));
 }
 
 function number(value: SqlValue, name: string, fallback?: number): number {
@@ -92,9 +111,9 @@ export function boardFromDatabase(db: Database): Board {
     .map(row => ({ id: integer(row.id, "items.id"), order: decodeOrder(storedVariant(row, "sort_order")) }));
   topRoots.sort((a, b) => compareOrder(a.order, b.order) || a.id - b.id);
   board.frontmostRootId = topRoots[topRoots.length - 1]?.id;
-  const imageRows = rows(db, "SELECT id,width,height,data,source_type FROM images LIMIT 10001");
-  check(imageRows.length <= 10000, "画像数が10000件の上限を超えています");
-  const images = new Map(imageRows.map(row => [integer(row.id, "images.id"), row]));
+  const sourceRows = storedRows(db, "images", "LIMIT 10001");
+  check(sourceRows.size <= 10000, "画像数が10000件の上限を超えています");
+  const images = new Map([...sourceRows].map(([id, row]) => [id, row.values]));
   const items = rows(db, `SELECT i.id,i.parent,i.opacity,i.z,
     CAST(i.transform AS BLOB) AS transform,typeof(i.transform) AS transform_type,
     CAST(i.sort_order AS BLOB) AS sort_order,typeof(i.sort_order) AS sort_order_type,
@@ -113,8 +132,9 @@ export function boardFromDatabase(db: Database): Board {
     if (!source || source.source_type !== 1 || !(source.data instanceof Uint8Array)) {
       warnings.add("外部リンク画像または画像データのない項目は表示していません"); continue;
     }
-    if (number(row.playback_state, "playback_state", 0) !== 0 ||
-        number(row.playback_frame, "playback_frame", 0) !== 0) {
+    const mime = imageMime(source.data);
+    if (mime !== "image/gif" && (number(row.playback_state, "playback_state", 0) !== 0 ||
+        number(row.playback_frame, "playback_frame", 0) !== 0)) {
       warnings.add("動画と保存された再生フレームは未対応のため表示していません"); continue;
     }
     // Both the default 0 and the real 2.1.3 fixture's 1 are accepted.
@@ -122,9 +142,8 @@ export function boardFromDatabase(db: Database): Board {
     if (![0, 1].includes(number(row.flags, "flags", 0))) {
       warnings.add("未対応の画像フラグを持つ項目は表示していません"); continue;
     }
-    const mime = imageMime(source.data);
     if (!mime) {
-      warnings.add("PNG、JPEG、GIF、WebP以外の画像は表示していません"); continue;
+      warnings.add("PNG、JPEG、GIF、WebP、BMP、SVG、HEIC以外の画像は表示していません"); continue;
     }
     const width = integer(source.width, "width"), height = integer(source.height, "height");
     check(width > 0 && height > 0 && width * height <= 40_000_000,
@@ -141,10 +160,20 @@ export function boardFromDatabase(db: Database): Board {
       },
     });
     if (mime === "image/gif" || mime === "image/webp")
-      warnings.add("アニメーションは再生せず、ブラウザーが読み込んだフレームを静止表示します");
+      warnings.add("GIFとWebPは先頭フレームを静止表示し、元の画像データを保持します");
   }
   ordered.sort((a, b) => a.image.z - b.image.z || compareOrder(a.order, b.order) || a.image.id - b.image.id);
   board.images = ordered.map(value => value.image);
+  if (board.images.length) {
+    const where = `WHERE id IN (${board.images.map(image => image.id).join(",")})`;
+    const itemRows = storedRows(db, "items", where);
+    const imageItemRows = storedRows(db, "items_images", where);
+    for (const image of board.images) {
+      const imageItem = imageItemRows.get(image.id)!;
+      image.stored = { item: itemRows.get(image.id)!, imageItem,
+        source: sourceRows.get(integer(imageItem.values.image, "image"))! };
+    }
+  }
   const displayedIds = new Set(board.images.map(image => image.id));
   board.maxHiddenRootZ = rootZ.filter(row => !displayedIds.has(integer(row.id, "items.id")))
     .reduce((max, row) => Math.max(max, number(row.z, "items.z", 0)), -Infinity);

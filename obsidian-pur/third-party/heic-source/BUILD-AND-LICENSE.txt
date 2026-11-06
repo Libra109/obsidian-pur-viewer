@@ -1,0 +1,69 @@
+HEIC decoder source distribution
+
+The application uses libheif-js 1.23.5's bundled WASM build in a Blob Worker,
+and the pure JavaScript build only when Worker/WASM is unavailable.
+libheif and its libde265 HEVC decoder are LGPL-3.0.
+All license texts are included in the source archives and in the generated
+THIRD-PARTY-NOTICES.txt. The original libheif-js package, including its
+JavaScript factory and wrapper, is also included.
+The Emscripten runtime license is included in EMSCRIPTEN-LICENSE.txt.
+
+Pinned corresponding library sources:
+  libheif-413e2a87.tar.gz:
+    strukturag/libheif commit 413e2a87e6a70b3eccc3a3adc5801179dd2d9e00
+  libde265-1.0.15.tar.gz:
+    upstream release v1.0.15, used by libheif/build-emscripten.sh
+  libheif-emscripten-1.23.5.tar.gz:
+    catdad-experiments/libheif-emscripten tag v1.23.5
+  libheif-js-1.23.5.tgz:
+    unmodified published npm package
+
+SHA-256 of library source archives:
+  ef8e86a4e5670b7338a58b17553e306b8be88e506587b265dfdfe44495896999  libheif-413e2a87.tar.gz
+  00251986c29d34d3af7117ed05874950c875dd9292d016be29d3b3762666511d  libde265-1.0.15.tar.gz
+  8e3395ca983e369448bea84d223c35f1117373953e00219588415f1bc37c86ea  libheif-emscripten-1.23.5.tar.gz
+  d0bfe7198bd624c524cef8ccf78e15ceb42683c87598c64c2e13ced0d8680932  libheif-js-1.23.5.tgz
+
+Library rebuild (Linux build host, matching upstream workflow):
+  Install Emscripten 3.1.61, CMake, autotools, Node.js, and TypeScript 5.
+  Extract libheif source and libde265 source tarball to a build directory.
+  Place libde265-1.0.15.tar.gz in the working directory so the upstream
+  build script does not need to download it.
+  Activate emsdk_env.sh and run:
+    USE_WASM=0 USE_UNSAFE_EVAL=0 USE_TYPESCRIPT=1 \
+      /path/to/libheif-source/build-emscripten.sh /path/to/libheif-source
+  Upstream build scripts, CI workflow and post.js bindings are in the archives.
+  This application does not modify the generated decoder's algorithms.
+  For the WASM decoder use the same sources and Emscripten version with:
+    USE_WASM=1 USE_UNSAFE_EVAL=0 USE_TYPESCRIPT=1 \
+      /path/to/libheif-source/build-emscripten.sh /path/to/libheif-source
+  The libheif-emscripten archive includes dist-prep.sh and its pinned CI
+  workflow for both targets. The libheif-js package includes the WASM bundle.
+
+Application rebuild / relink with a modified decoder:
+  HEIC-SOURCES/application contains the application source, build scripts,
+  package manifests, styles and license. Copy the contents to obsidian-pur/
+  under a directory containing the supplied top-level LICENSE.
+  Recreate third-party/heic-source from the files alongside this document.
+  Run npm ci, replace node_modules/libheif-js/libheif/libheif.js with your
+  modified pure-JavaScript factory if desired. For a modified WASM decoder,
+  replace node_modules/libheif-js/libheif-wasm/libheif-bundle.js with your
+  self-contained WASM factory. Run npm run build.
+  build.mjs bundles src/heic-worker.ts, including the WASM binary, and embeds
+  it into src/heic-worker-source.ts during the application build.
+  No separately fetched worker script or .wasm asset is required at runtime.
+  Worker/client/codec sources are included in HEIC-SOURCES/application/src.
+  build.mjs forces only the browser environment branch; no HEIC data is
+  converted or re-encoded for storage.
+  Replace the generated main.js in your own plugin installation.
+  No signing, installation keys or technical relinking restrictions exist.
+  Reverse engineering for debugging library modifications is permitted.
+
+Distribution:
+  Keep HEIC-SOURCES/ together with main.js and THIRD-PARTY-NOTICES.txt when
+  redistributing this combined work. It includes the corresponding library
+  source archives and corresponding application source needed to relink.
+  This is not a source-download offer: the archives are included offline.
+  Application source retains its MIT license; the library retains LGPL-3.0.
+  No warranty is provided. HEVC patent licensing may apply independently of
+  copyright licenses; this project does not grant patent clearance.
