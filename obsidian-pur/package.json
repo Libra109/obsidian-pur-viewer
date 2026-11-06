@@ -1,0 +1,24 @@
+{
+  "name": "obsidian-lazyref-pur",
+  "version": "0.8.4",
+  "private": true,
+  "description": "PureRef board viewer and placement editor for desktop and mobile Obsidian",
+  "scripts": {
+    "build": "tsc --noEmit && node build.mjs",
+    "test": "tsx --test tests/*.test.ts",
+    "test:browser": "node tests/serve-browser.mjs"
+  },
+  "dependencies": {
+    "spark-md5": "3.0.2",
+    "sql.js": "1.14.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/spark-md5": "^3.0.5",
+    "@types/sql.js": "^1.4.9",
+    "esbuild": "^0.25.0",
+    "obsidian": "^1.8.7",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  }
+}
